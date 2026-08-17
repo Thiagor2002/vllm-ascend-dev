@@ -7,10 +7,12 @@
 还包含独立的输入准备、Attention、ACL Graph、多模态、采样、KV Cache、量化和权重
 NZ 逻辑，不能仅通过替换 runner 基类完成迁移。
 
-本适配必须等待上游 [vLLM PR #43048](https://github.com/vllm-project/vllm/pull/43048)
-合入后启动。该 PR 引入 Triton kernel dispatcher，允许调用方继续使用
-`kernel[grid](...)`，平台插件通过 `register_kernel()` 注册替代实现。310P 可以注册
-PyTorch、NumPy、`torch_npu` 或 ACLNN 实现，不要求替代实现本身是 Triton kernel。
+本适配最初计划依赖上游 [vLLM PR #43048](https://github.com/vllm-project/vllm/pull/43048)
+引入的 Triton kernel dispatcher：调用方继续使用 `kernel[grid](...)`，平台插件通过
+`register_kernel()` 注册 PyTorch、NumPy、`torch_npu` 或 ACLNN 实现。该 PR 至今未合入
+vLLM 主线，因此**第一版不依赖该机制**，改为使用仓库既有的类级别与模块级别替换边界
+（详见第 4 章）。dispatcher 合入后的接入点保留在
+`_310p/worker/v2/kernel_registry.py`。
 
 310P Model Runner V2 的最终目标是与 310P Model Runner V1 **能力完全对齐，不新增、
 不减少**。为了控制首版风险，采用分阶段交付：
@@ -105,76 +107,74 @@ PyTorch、NumPy、`torch_npu` 或 ACLNN 实现，不要求替代实现本身是 
 
 第二版不增加 Eagle、ngram、DFlash 或其他 speculative decoding 方法。
 
-## 4. 上游 Triton Dispatcher 前置条件
+## 4. Triton 替换策略
 
-### 4.1 开发启动门禁
+### 4.1 为什么第一版不使用 dispatcher
 
-第一版开发必须满足：
+PR #43048 尚未合入 vLLM 主线，一旦在 `import` 期依赖
+`vllm.model_executor.triton_dispatcher`，插件在主线 vLLM 上会直接 `ImportError`。同时
+dispatcher 只能替换显式添加 `@pluggable_kernel` 的对象，而 310P 首版可达的 Triton 路径
+（staged write、gather、多维 RoPE、采样）在上游都没有该装饰器，仅靠 dispatcher 也无法
+覆盖。因此第一版全部使用仓库既有的替换边界：
 
-1. PR #43048 已合入目标 vLLM 分支，而不是仅在开发分支存在；
-2. vLLM Ascend 已同步包含该 PR 的确定 commit；
-3. 确认最终 API 名称、注册时机和 kernel 全限定名；
-4. 确认自定义实现支持 `kernel[grid](...)` 和直接调用；
-5. 确认 registry 不会因注册结果缓存而错过后注册实现；
-6. 在适配 PR 中记录对应 vLLM commit，不能只写“最新 main”。
+| 替换边界 | 使用位置 | 说明 |
+| --- | --- | --- |
+| 类替换（patch 模块属性） | `patch_v2/patch_block_table.py` | 310P 使用 `Ascend310PBlockTables` |
+| 类属性扩展点 | `request_state_cls`、`aclgraph_manager_cls` | runner 内注入 310P 实现 |
+| 子类覆写 | `Ascend310PModelState`、`Ascend310PRopeState` | 多模态 position/state |
+| 模块属性替换 | `patch_v2/patch_triton.py` | 采样类 kernel 全平台替换 |
 
-上游 PR 的初始示例只改造 `rejection_sampler.expand_kernel`。它合入后不代表 Model Runner
-V2 的所有 Triton kernel 已自动可替换。310P 适配前必须建立完整 kernel inventory。
+这些边界与仓库其他 NPU 适配一致，不额外引入新的分发机制。
 
-### 4.2 推荐注册架构
+### 4.2 目录边界与 dispatcher 接入点
 
 第一版采用以下目录边界：
 
 ```text
 vllm_ascend/
-├── worker/v2/block_table.py                # 默认 Triton kernel + pluggable_kernel
+├── worker/v2/block_table.py                # 公共默认 Triton kernel，保持与主线一致
 └── _310p/worker/v2/
-    ├── kernel_registry.py                  # 310P 原生实现注册入口
+    ├── kernel_registry.py                  # dispatcher 合入后的唯一接入点
     ├── model_runner.py                     # 仅保留 runner 契约差异
-    ├── block_table.py                      # CPU-owned V2 BlockTables
+    ├── block_table.py                      # CPU-owned V2 BlockTables + NumPy slot mapping
     ├── states.py                           # 无 Triton staged-write state
     ├── model_state.py                      # 310P 多模态 RoPE/model state
     └── aclgraph.py                         # 310P V2 graph 策略
 ```
 
-310P V2 runner 模块导入阶段只做一次集中注册；V1 路径不导入注册模块：
+`kernel_registry.register_310p_kernels()` 只在导入 310P V2 runner 时调用一次；V1 路径不
+导入该模块。当前 `KERNEL_IMPLS` 为空，函数为 no-op；PR #43048 合入后，只需登记
+kernel 全限定名与 310P 实现，调用侧保持 `kernel[grid](...)`，并可同步删除对应的子类
+覆写。允许设备判断存在于该入口，但不允许在 Model Runner V2 主流程和每个 kernel 调用
+点散落 `is_310p()`。
 
-```python
-@register_kernel(
-    "vllm_ascend.worker.v2.block_table._compute_slot_mappings_kernel"
-)
-def compute_slot_mappings_310p(..., grid=None):
-    ...
-```
+### 4.3 替换机制的边界
 
-允许设备判断存在于注册入口，但不允许在 Model Runner V2 主流程和每个 kernel 调用点
-散落 `is_310p()`。调用侧统一保留上游接口。
-
-### 4.3 Dispatcher 的边界
-
-dispatcher 只解决“调用哪个实现”，不自动解决：
+无论使用类替换还是未来的 dispatcher，都不自动解决：
 
 - 默认 Triton 模块能否在无 Triton 环境完成 import；
-- 未添加 `@pluggable_kernel` 的 kernel；
 - 需要 CPU request-state mirror 的高层算法；
 - graph capture 中 tensor 地址、shape 和 stream 顺序；
 - 同一进程中按不同设备动态切换实现。
 
 第一版必须建立两道门禁：
 
-1. **Import gate**：310P 镜像必须能导入被 `@triton.jit` 定义的默认实现；该方案允许
-   安装 Triton Python 包，但不允许在 310P 上编译或执行 Triton kernel；
+1. **Import gate**：310P 进程不导入定义默认 Triton kernel 的模块；确实需要导入时，镜像
+   必须能完成 `@triton.jit` 的模块级定义。允许安装 Triton Python 包，但不允许在 310P 上
+   编译或执行 Triton kernel；
 2. **Invocation gate**：真实请求执行期间没有 Triton kernel 编译或调用。
 
-如果 310P 镜像完全不包含 Triton Python 包，`@pluggable_kernel` 也无法阻止内层
-`@triton.jit` 在模块定义阶段求值。这种环境需要进一步提供 lazy/default stub 机制；不能
-通过伪造 `HAS_TRITON=True` 解决。
+310P V2 BlockTables 不导入 `vllm_ascend/worker/v2/block_table.py`，因此不受该模块的
+`@triton.jit` 定义影响；单元测试对该约束做静态校验。若镜像完全不包含 Triton Python
+包，则需要进一步提供 lazy/default stub 机制，不能通过伪造 `HAS_TRITON=True` 解决。
 
 ### 4.4 分版本 Kernel Inventory
 
-| 路径 | 第一版 | 第二版 | 推荐分发边界 |
+| 路径 | 第一版 | 第二版 | 使用的替换边界 |
 | --- | --- | --- | --- |
-| Block table slot mapping | 必须 | 回归 | vLLM Ascend 自有 pluggable kernel |
+| Block table slot mapping | 必须 | 回归 | 310P BlockTables 内 NumPy 实现 |
+| Block table staged write/gather | 必须 | 回归 | 310P BlockTables/RequestState |
+| 多维 RoPE position | 多模态必须 | 回归 | `Ascend310PRopeState` |
 | KV block zeroer | 仅非 MTP 可达路径 | MTP 清零 | zeroer 类/function |
 | greedy sampling | 必须 | 回归 | sampler function |
 | random/gumbel | 暂缓 | 必须 | sampler function/kernel |
@@ -182,13 +182,13 @@ dispatcher 只解决“调用哪个实现”，不自动解决：
 | penalties/bincount | 暂缓 | 必须 | function + kernel |
 | bad words | 暂缓 | 必须 | function + kernel |
 | logprobs | 暂缓 | 必须 | function + kernel |
-| grammar bitmask | 暂缓 | 必须 | pluggable kernel |
+| grammar bitmask | 暂缓 | 必须 | 模块属性替换 |
 | rejection sampling | 禁用 | MTP 必须 | function + kernels |
-| DFlash kernels | 禁用 | 禁用 | 不注册 |
+| DFlash kernels | 禁用 | 禁用 | 不替换 |
 
-slot mapping 的 dispatcher ABI 必须传递实际 block-table Tensor，不能只传 raw pointer
-数组。默认 Triton 实现和 310P 注册实现保持相同参数语义；310P 仍从 scheduler 和 CPU
-state 构造 position，避免从 device tensor 反向 D2H。
+310P slot mapping 直接消费 scheduler 和 CPU state 的 request index、`query_start_loc` 与
+position，避免从 device tensor 反向 D2H；公共 `AscendBlockTables` 与其 raw-pointer ABI
+保持主线形态不变。
 
 ## 5. 当前 V1 到 V2 的差异映射
 
@@ -246,31 +246,19 @@ else:
 
 ### 阶段 2：替换第一版可达的 Triton 路径
 
-PR #43048 提供通用 dispatcher，但不会自动拦截其他 kernel。第一版不修改 vLLM 上游，
-只在 vLLM Ascend 自有且首版可达的 Triton kernel 上增加：
-
-```python
-@pluggable_kernel
-@triton.jit
-def _compute_slot_mappings_kernel(...):
-    ...
-```
-
-310P 按该函数的全限定名注册非 Triton 实现。未注册时，910B/910C 继续执行默认 Triton。
-第一版的具体替换如下：
+第一版不修改 vLLM 上游，也不修改公共 `AscendBlockTables`，只在 `_310p` 目录内提供
+无 Triton 实现，并通过既有 patch 与类扩展点接入。第一版的具体替换如下：
 
 1. 310P `BlockTables` 使用 CPU request metadata 生成 block table 和 slot mapping；
 2. `RequestState` 和多模态 RoPE 使用 CPU owner、脏行 H2D 和原生 NPU tensor 操作；
 3. input IDs、position、sequence length 和 chunked-prefill 状态由 CPU mirror 构造；
 4. greedy sampler 和 post-update 使用原生 PyTorch/NPU 算子；
 5. KV block zeroer 使用直接 tensor 清零；
-6. 仅在导入 310P V2 runner 时导入 `kernel_registry.py`；V1 runner 不导入注册模块，
-   同时禁止 V2 注册失败后静默回退默认 Triton。
+6. 仅在导入 310P V2 runner 时调用 `kernel_registry.register_310p_kernels()`；V1 runner 不
+   导入该模块，同时禁止 310P 静默回退默认 Triton 实现。
 
-随机采样、logprob、grammar、rejection sampling 和 DFlash 等首版不可达能力不增加
-310P 注册实现，也不为了形式完整提前添加空实现。第二版适配后处理和 MTP 时，再给对应
-的 vLLM Ascend 自有 kernel 增加装饰器与注册实现。vLLM 上游未加装饰器的 kernel 仍不能
-通过该机制替换，必要时继续使用类级别或高层扩展边界。
+随机采样、logprob、grammar、rejection sampling 和 DFlash 等首版不可达能力不提供 310P
+实现，也不为了形式完整提前添加空实现。第二版适配后处理和 MTP 时再补齐对应替换。
 
 ### 阶段 3：适配 RequestState、InputBatch 和 Slot Mapping
 
@@ -449,8 +437,8 @@ dummy load 可以先验证结构、算子和 API 路径，但最终结论必须�
 - sampled token logprobs、prompt logprobs；
 - V1 已支持范围内的 grammar bitmask/structured output。
 
-通过 dispatcher 注册 310P 非 Triton实现；参数不能被静默忽略。TP1/TP2、eager/graph
-分别执行与 V1 的行为对比。
+通过第 4 章的替换边界提供 310P 非 Triton 实现；参数不能被静默忽略。TP1/TP2、
+eager/graph 分别执行与 V1 的行为对比。
 
 ### 8.3 MTP
 
@@ -475,7 +463,7 @@ DFlash、DSpark 继续明确拒绝。
 - 第一版模型/功能矩阵 E2E；
 - 第二版 prefix cache、后处理、MTP E2E；
 - 现有 310P V1 回归，确保行为未减少；
-- 非 310P 通用 V2 回归，确保全局 registry 未污染其他平台；
+- 非 310P 通用 V2 回归，确保 310P 替换未污染其他平台；
 - 配置拒绝测试，确保未支持能力不会误入；
 - 无 Triton import/invocation 门禁；
 - dummy 与真实权重证据分开记录；
@@ -483,11 +471,13 @@ DFlash、DSpark 继续明确拒绝。
 
 ## 10. 重点风险
 
-- **上游 API 风险**：PR #43048 合入前接口可能变化，禁止固化临时 API。
+- **上游 API 风险**：PR #43048 未合入且接口可能变化，禁止在导入期依赖该模块。
 - **能力漂移风险**：不得因 V2 已有功能而扩大 310P 范围，也不得漏掉 V1 已有能力。
-- **Dispatcher 覆盖不足**：一个 `expand_kernel` 不能让整个 V2 脱离 Triton。
+- **替换覆盖不足**：替换单个 kernel 不能让整个 V2 脱离 Triton，必须逐路径核对
+  inventory。
 - **Import 风险**：不调用 Triton 不代表无 Triton 环境可 import 默认模块。
-- **全局 registry 风险**：同名 kernel 后注册覆盖前者，测试进程要隔离注册状态。
+- **全局替换风险**：模块属性替换和未来的 kernel 注册都是进程级生效，测试进程要隔离
+  这些状态。
 - **D2H 风险**：从 device position 反算 CPU slot mapping 会每步同步。
 - **图地址风险**：replay 前重建 tensor 会破坏固定地址。
 - **TP 风险**：单卡通过不能证明 shard、collective、LM head gather 正确。
@@ -503,7 +493,7 @@ DFlash、DSpark 继续明确拒绝。
 
 ### 11.1 第一版完成
 
-- PR #43048 已合入并锁定对应 vLLM commit；
+- 不依赖未合入的上游 PR，在主线 vLLM 上可直接导入运行；
 - 显式开关选择 310P V2 runner，关闭时 V1 不变；
 - 310P 真实请求中无 Triton 编译和执行；
 - Qwen3-8B、Qwen3.5-4B TP1/TP2 通过；

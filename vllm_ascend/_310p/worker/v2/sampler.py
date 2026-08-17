@@ -9,7 +9,13 @@ from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
 
 class Ascend310PGreedySampler:
-    """Minimal first-release sampler which only accepts greedy requests."""
+    """Minimal first-release sampler which only accepts greedy requests.
+
+    Non-greedy parameters are rejected in ``add_request`` so the object still
+    satisfies the upstream sampler interface at construction time. Unsupported
+    sampling configs therefore fail on the first real request rather than
+    during engine init.
+    """
 
     def __init__(self) -> None:
         self.penalties_state = SimpleNamespace(output_bin_counts=None)

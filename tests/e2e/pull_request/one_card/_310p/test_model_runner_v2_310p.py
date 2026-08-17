@@ -7,15 +7,18 @@ from unittest.mock import patch
 import pytest
 
 from tests.e2e.conftest import VllmRunner, wait_until_npu_memory_free
-from tests.e2e.pull_request.utils_310p import run_vl_model_test
+from tests.e2e.pull_request.utils_310p import (
+    FULL_DECODE_ONLY_GRAPH,
+    hybrid_runner_kwargs,
+    run_vl_model_test,
+)
 
 
 @patch.dict(os.environ, {"VLLM_USE_V2_MODEL_RUNNER": "1"})
 @wait_until_npu_memory_free(0.7)
-@pytest.mark.parametrize("model", ["Qwen/Qwen3-8B", "Qwen/Qwen3.5-4B"])
+@pytest.mark.parametrize("model", ["Qwen/Qwen3-8B", "Qwen/Qwen3.5-2B", "Qwen/Qwen3.5-4B"])
 def test_model_runner_v2_tp1_chunked_prefill_aclgraph(model: str) -> None:
     prompts = [("The following ledger contains numbered entries. " * 96) + "Summarize entry one."] * 4
-    kwargs = {"mamba_ssm_cache_dtype": "float16"} if model == "Qwen/Qwen3.5-4B" else {}
     with VllmRunner(
         model,
         tensor_parallel_size=1,
@@ -24,11 +27,8 @@ def test_model_runner_v2_tp1_chunked_prefill_aclgraph(model: str) -> None:
         max_num_batched_tokens=256,
         max_num_seqs=4,
         enable_prefix_caching=False,
-        compilation_config={
-            "cudagraph_mode": "FULL_DECODE_ONLY",
-            "cudagraph_capture_sizes": [1, 2, 4],
-        },
-        **kwargs,
+        compilation_config=FULL_DECODE_ONLY_GRAPH,
+        **hybrid_runner_kwargs(model),
     ) as runner:
         outputs = runner.generate_greedy(prompts, max_tokens=4)
 
@@ -42,6 +42,7 @@ def test_model_runner_v2_tp1_chunked_prefill_aclgraph(model: str) -> None:
     [
         "vllm-ascend/Qwen3-8B-W8A8",
         "vllm-ascend/Qwen3-8B-w8a8sc-310-vllm-tp1",
+        "vllm-ascend/Qwen3-8B-W8A8-Dynamic",
     ],
 )
 def test_model_runner_v2_tp1_quantized_nz(model: str) -> None:
@@ -64,10 +65,29 @@ def test_model_runner_v2_tp1_quantized_nz(model: str) -> None:
 
 @patch.dict(os.environ, {"VLLM_USE_V2_MODEL_RUNNER": "1"})
 @wait_until_npu_memory_free(0.7)
-def test_model_runner_v2_qwen3_vl_tp1() -> None:
+@pytest.mark.parametrize("model", ["Qwen/Qwen3-VL-2B-Instruct", "Qwen/Qwen3-VL-8B-Instruct"])
+def test_model_runner_v2_qwen3_vl_tp1(model: str) -> None:
     run_vl_model_test(
-        model_name="Qwen/Qwen3-VL-8B-Instruct",
+        model_name=model,
         tensor_parallel_size=1,
         max_tokens=5,
         enable_prefix_caching=False,
+    )
+
+
+@patch.dict(os.environ, {"VLLM_USE_V2_MODEL_RUNNER": "1"})
+@wait_until_npu_memory_free(0.7)
+@pytest.mark.parametrize("model", ["Qwen/Qwen3-VL-2B-Instruct", "Qwen/Qwen3-VL-8B-Instruct"])
+def test_model_runner_v2_qwen3_vl_tp1_aclgraph(model: str) -> None:
+    # Vision encoder stays eager during prefill; only decode is captured.
+    run_vl_model_test(
+        model_name=model,
+        tensor_parallel_size=1,
+        max_tokens=5,
+        enforce_eager=False,
+        enable_prefix_caching=False,
+        compilation_config={
+            "cudagraph_mode": "FULL_DECODE_ONLY",
+            "cudagraph_capture_sizes": [1, 2],
+        },
     )

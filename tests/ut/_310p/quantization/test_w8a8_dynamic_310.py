@@ -105,7 +105,7 @@ class TestAscendW8A8DynamicLinearMethod310(TestBase):
 
         output = self.method.apply(layer, x, tp_rank=0)
 
-        mock_npu_dynamic_quantize.assert_called_with(x)
+        mock_npu_dynamic_quantize.assert_called_once_with(x, dst_type=torch.int8)
         mock_npu_quant_matmul.assert_called_once()
         (args, kwargs) = mock_npu_quant_matmul.call_args
 
@@ -143,3 +143,51 @@ class TestAscendW8A8DynamicLinearMethod310(TestBase):
         self.method.process_weights_after_loading(layer)
 
         mock_npu_format_cast.assert_called_once()
+        self.assertEqual(layer.weight.data.shape, (256, 128))
+        self.assertEqual(layer.weight_scale.data.shape, (128,))
+        self.assertEqual(layer.weight_offset.data.shape, (128,))
+
+    @patch("vllm_ascend.utils.is_310p", return_value=True)
+    @patch("torch_npu.npu_format_cast")
+    def test_moe_process_weights_transposes_output_dimension_before_nz(self, mock_npu_format_cast, _mock_is_310p):
+        mock_npu_format_cast.side_effect = lambda x, fmt: x
+        method = AscendW8A8DynamicFusedMoEMethod310.__new__(AscendW8A8DynamicFusedMoEMethod310)
+        layer = MagicMock()
+        layer.w13_weight = MagicMock()
+        layer.w2_weight = MagicMock()
+        layer.w13_weight_scale = MagicMock()
+        layer.w13_weight_offset = MagicMock()
+        layer.w2_weight_scale = MagicMock()
+        layer.w2_weight_offset = MagicMock()
+
+        num_experts, intermediate_size, hidden_size = 8, 96, 256
+        layer.w13_weight.data = torch.randint(
+            -127,
+            128,
+            (num_experts, 2 * intermediate_size, hidden_size),
+            dtype=torch.int8,
+        )
+        layer.w2_weight.data = torch.randint(
+            -127,
+            128,
+            (num_experts, hidden_size, intermediate_size),
+            dtype=torch.int8,
+        )
+        layer.w13_weight_scale.data = torch.randn(num_experts, 2 * intermediate_size, 1)
+        layer.w13_weight_offset.data = torch.zeros(num_experts, 2 * intermediate_size, 1)
+        layer.w2_weight_scale.data = torch.randn(num_experts, hidden_size, 1)
+        layer.w2_weight_offset.data = torch.zeros(num_experts, hidden_size, 1)
+
+        method.process_weights_after_loading(layer)
+
+        self.assertEqual(
+            layer.w13_weight.data.shape,
+            (num_experts, hidden_size, 2 * intermediate_size),
+        )
+        self.assertEqual(
+            layer.w2_weight.data.shape,
+            (num_experts, intermediate_size, hidden_size),
+        )
+        self.assertEqual(layer.w13_weight_scale.data.shape, (num_experts, 2 * intermediate_size))
+        self.assertEqual(layer.w2_weight_scale.data.shape, (num_experts, hidden_size))
+        self.assertEqual(mock_npu_format_cast.call_count, 2)

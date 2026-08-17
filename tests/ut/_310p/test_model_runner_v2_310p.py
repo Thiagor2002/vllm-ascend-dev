@@ -14,6 +14,7 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 
 from vllm_ascend._310p.attention.attention_v1 import AscendAttentionBackend310
 from vllm_ascend._310p.worker.v2.block_table import Ascend310PBlockTables
+from vllm_ascend._310p.worker.v2.feature_support import MRv2FeatureSupport
 from vllm_ascend._310p.worker.v2.model_runner import NPUModelRunner310V2
 from vllm_ascend._310p.worker.v2.model_state import (
     Ascend310PMambaHybridModelState,
@@ -172,9 +173,7 @@ def test_310p_mrope_state_prepares_cos_sin_before_model_forward() -> None:
         num_computed_tokens_np=np.array([0]),
     )
 
-    with patch(
-        "vllm_ascend._310p.worker.v2.model_state.prepare_mrope_cos_sin_slices_from_runner"
-    ) as prepare_slices:
+    with patch("vllm_ascend._310p.worker.v2.model_state.prepare_mrope_cos_sin_slices_from_runner") as prepare_slices:
         model_inputs = model_state.prepare_inputs(input_batch, req_states)
 
     model_state.rope_state.prepare_positions_cpu.assert_called_once()
@@ -202,7 +201,7 @@ def test_first_release_config_rejects_speculative_decoding() -> None:
     config = _make_vllm_config()
     config.speculative_config = SimpleNamespace(method="mtp")
 
-    with pytest.raises(NotImplementedError, match="deferred to the second"):
+    with pytest.raises(NotImplementedError, match="Qwen3.5 MTP/speculative decoding"):
         NPUModelRunner310V2._validate_first_release_config(config)
 
 
@@ -212,6 +211,24 @@ def test_first_release_config_rejects_prefix_caching() -> None:
 
     with pytest.raises(NotImplementedError, match="deferred to the second"):
         NPUModelRunner310V2._validate_first_release_config(config)
+
+
+def test_future_feature_support_is_an_explicit_runner_extension_point() -> None:
+    class FutureNPUModelRunner310V2(NPUModelRunner310V2):
+        feature_support = MRv2FeatureSupport(prefix_caching=True, qwen3_5_mtp=True)
+
+    config = _make_vllm_config()
+    config.cache_config.enable_prefix_caching = True
+    config.speculative_config = SimpleNamespace(method="mtp")
+
+    FutureNPUModelRunner310V2._validate_first_release_config(config)
+
+
+def test_first_release_capability_properties_do_not_advertise_future_features() -> None:
+    runner = object.__new__(NPUModelRunner310V2)
+    assert runner.supports_prefix_caching is False
+    assert runner.supports_qwen3_5_mtp is False
+    assert runner.supports_mtp is False
 
 
 def test_first_release_config_rejects_expert_parallelism() -> None:
@@ -415,18 +432,10 @@ def test_v2_selects_64_kernel_block_for_256_head_size() -> None:
     )
     runner = object.__new__(NPUModelRunner310V2)
     runner.attn_groups = [
-        [
-            SimpleNamespace(
-                backend=SimpleNamespace(
-                    get_supported_kernel_block_sizes=lambda: [128, 64]
-                )
-            )
-        ]
+        [SimpleNamespace(backend=SimpleNamespace(get_supported_kernel_block_sizes=lambda: [128, 64]))]
     ]
     runner.kernel_block_sizes = [128]
-    kv_cache_config = SimpleNamespace(
-        kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)]
-    )
+    kv_cache_config = SimpleNamespace(kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)])
 
     runner._adjust_kernel_block_sizes_310p(kv_cache_config)
 
@@ -464,9 +473,7 @@ def test_v2_separates_attention_and_mamba_shared_cache_slot() -> None:
         num_blocks=num_blocks,
     )
     runner = object.__new__(NPUModelRunner310V2)
-    runner.attn_groups = [
-        [SimpleNamespace(backend=AscendAttentionBackend310, layer_names=[attention_layer])]
-    ]
+    runner.attn_groups = [[SimpleNamespace(backend=AscendAttentionBackend310, layer_names=[attention_layer])]]
     runner.kernel_block_sizes = [128, 0]
     runner.cache_config = SimpleNamespace(cache_dtype="auto")
     runner.device = torch.device("cpu")
@@ -516,6 +523,61 @@ def test_block_tables_use_cpu_metadata_for_gather_and_slot_mapping() -> None:
     )
     expected = torch.tensor([[80, 81, 44, 45, -1, -1, -1, -1]], dtype=torch.int32)
     torch.testing.assert_close(slots, expected)
+
+
+def test_block_tables_compute_slot_mappings_per_cache_group() -> None:
+    block_tables = Ascend310PBlockTables(
+        block_sizes=[4, 8],
+        max_num_reqs=2,
+        max_num_batched_tokens=4,
+        max_num_blocks_per_group=[4, 2],
+        device=torch.device("cpu"),
+        kernel_block_sizes=[4, 8],
+    )
+    block_tables.append_block_ids(0, ([10, 11], [20]), overwrite=True)
+
+    slots = block_tables.compute_slot_mappings(
+        np.array([0], dtype=np.int32),
+        np.array([0, 3], dtype=np.int32),
+        np.array([3, 4, 5], dtype=np.int64),
+        num_tokens_padded=4,
+    )
+
+    expected = torch.tensor(
+        [
+            [43, 44, 45, -1],
+            [163, 164, 165, -1],
+        ],
+        dtype=torch.int32,
+    )
+    torch.testing.assert_close(slots, expected)
+
+
+def test_block_tables_pad_slot_mappings_when_no_tokens_are_scheduled() -> None:
+    block_tables = Ascend310PBlockTables(
+        block_sizes=[4],
+        max_num_reqs=1,
+        max_num_batched_tokens=4,
+        max_num_blocks_per_group=[1],
+        device=torch.device("cpu"),
+        kernel_block_sizes=[4],
+    )
+    block_tables.append_block_ids(0, ([7],), overwrite=True)
+    block_tables.compute_slot_mappings(
+        np.array([0], dtype=np.int32),
+        np.array([0, 2], dtype=np.int32),
+        np.array([0, 1], dtype=np.int64),
+        num_tokens_padded=4,
+    )
+
+    slots = block_tables.compute_slot_mappings(
+        np.array([], dtype=np.int32),
+        np.array([0], dtype=np.int32),
+        np.array([], dtype=np.int64),
+        num_tokens_padded=4,
+    )
+
+    torch.testing.assert_close(slots, torch.full((1, 4), -1, dtype=torch.int32))
 
 
 def test_block_tables_reject_device_metadata() -> None:

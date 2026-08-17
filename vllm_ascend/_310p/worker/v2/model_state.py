@@ -136,6 +136,10 @@ class _Ascend310PModelStateMixin:
         return {"positions": positions}
 
     def custom_sampler(self, sampler):
+        # Upstream GPUModelRunner.__init__ calls model_state.custom_sampler()
+        # when the hook exists. NPUModelRunner310V2 also assigns
+        # Ascend310PGreedySampler() on the runner; returning the same class
+        # here keeps both call sites on the first-release greedy path.
         del sampler
         return Ascend310PGreedySampler(), None
 
@@ -150,6 +154,8 @@ class Ascend310PModelState(_Ascend310PModelStateMixin, AscendModelState):
         encoder_cache: EncoderCache | None,
         device: torch.device,
     ) -> None:
+        # Standard attention only needs the 310P RoPE/graph subset. Hybrid
+        # models must call the full parent constructor first (see below).
         self._init_310p_state(vllm_config, model, encoder_cache, device)
 
 

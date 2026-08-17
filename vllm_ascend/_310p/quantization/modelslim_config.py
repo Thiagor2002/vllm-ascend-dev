@@ -76,7 +76,16 @@ def create_scheme_for_layer(
     if scheme_cls is not None:
         return scheme_cls()
 
-    err_msg = f"Unsupported quant_type={quant_type} for layer_type={layer_type}."
+    hint = ""
+    if layer_type == "moe":
+        # 310P MoE quantization is implemented by npu_quant_grouped_matmul_dequant
+        # with quant_mode="pertoken" (W8A8_DYNAMIC only, same as the 910B registry).
+        # Static W8A8/W8A8SC MoE descriptions are unsupported in the first release.
+        hint = (
+            " On 310P, MoE layers only support W8A8_DYNAMIC; re-quantize the "
+            "checkpoint with per-channel dynamic scales for experts."
+        )
+    err_msg = f"Unsupported quant_type={quant_type} for layer_type={layer_type}.{hint}"
     logger.error(err_msg)
     raise NotImplementedError(err_msg)
 

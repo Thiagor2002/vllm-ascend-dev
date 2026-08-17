@@ -11,6 +11,34 @@ from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.worker.gpu.block_table import BlockTables
 
 
+def _compute_group_slot_mappings(
+    block_table_np: np.ndarray,
+    idx_mapping_np: np.ndarray,
+    query_start_loc_np: np.ndarray,
+    positions_np: np.ndarray,
+    block_size: int,
+    out_np: np.ndarray,
+) -> None:
+    """Fill one KV cache group's slot IDs from CPU request metadata.
+
+    This is the NumPy equivalent of the default Triton slot-mapping kernel, and
+    matches the computation the 310P Model Runner V1 block table already uses.
+    """
+    out_np.fill(PAD_SLOT_ID)
+    num_reqs = idx_mapping_np.shape[0]
+    num_tokens = int(query_start_loc_np[num_reqs])
+    if num_tokens == 0:
+        return
+    if positions_np.shape[0] < num_tokens:
+        raise ValueError(f"positions holds {positions_np.shape[0]} tokens but query_start_loc describes {num_tokens}.")
+
+    tokens_per_req = np.diff(query_start_loc_np[: num_reqs + 1])
+    req_indices = np.repeat(idx_mapping_np, tokens_per_req)
+    positions = positions_np[:num_tokens]
+    block_numbers = block_table_np[req_indices, positions // block_size].astype(np.int64, copy=False)
+    out_np[:num_tokens] = block_numbers * block_size + positions % block_size
+
+
 class Ascend310PBlockTables(BlockTables):
     """V2 block tables that never launch a Triton kernel.
 
@@ -18,6 +46,11 @@ class Ascend310PBlockTables(BlockTables):
     uses those mirrors to gather input block tables and compute slot mappings,
     then copies the result into persistent NPU tensors used by eager execution
     and ACL Graph replay. No device-to-host synchronization is introduced.
+
+    The whole class replaces the upstream one through
+    ``patch/worker/patch_v2/patch_block_table.py``, so 310P needs no per-kernel
+    dispatch mechanism: staged writes, gather and slot mapping are all Triton
+    free here.
     """
 
     def __init__(
@@ -66,6 +99,11 @@ class Ascend310PBlockTables(BlockTables):
             dtype=torch.int32,
             device="cpu",
         )
+        # NumPy views over the CPU owners, so gather and slot mapping stay in
+        # NumPy without re-wrapping the tensors on every step.
+        self.block_tables_np = [table.numpy() for table in self.block_tables_cpu]
+        self.input_block_tables_np = [table.numpy() for table in self.input_block_tables_cpu]
+        self.slot_mappings_np = self.slot_mappings_cpu.numpy()
 
         # reshape_and_cache on 310P consumes int32 slot IDs.
         self.slot_mappings = torch.full(
@@ -121,15 +159,19 @@ class Ascend310PBlockTables(BlockTables):
         if num_reqs_padded < num_reqs:
             raise ValueError(f"num_reqs_padded ({num_reqs_padded}) is smaller than num_reqs ({num_reqs}).")
 
-        for group_id, (source, host_output, device_output) in enumerate(
-            zip(self.block_tables_cpu, self.input_block_tables_cpu, self.input_block_tables)
+        for group_id, (source_np, host_output_np, host_output, device_output) in enumerate(
+            zip(
+                self.block_tables_np,
+                self.input_block_tables_np,
+                self.input_block_tables_cpu,
+                self.input_block_tables,
+            )
         ):
-            host_output[:num_reqs_padded].zero_()
-            host_output_np = host_output.numpy()
+            host_output_np[:num_reqs_padded] = 0
             for batch_idx, req_idx in enumerate(idx_mapping_np):
                 num_blocks = int(self.num_blocks_np[group_id, req_idx])
                 if num_blocks:
-                    host_output_np[batch_idx, :num_blocks] = source.numpy()[req_idx, :num_blocks]
+                    host_output_np[batch_idx, :num_blocks] = source_np[req_idx, :num_blocks]
             device_output[:num_reqs_padded].copy_(host_output[:num_reqs_padded], non_blocking=True)
 
         return tuple(table[:num_reqs_padded] for table in self.input_block_tables)
@@ -142,39 +184,24 @@ class Ascend310PBlockTables(BlockTables):
         num_tokens_padded: int,
         out: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # Delay importing the default Triton kernel until Model Runner V2 is
-        # actually used. Importing this BlockTables class alone must not add a
-        # Triton dependency or dispatcher side effect to Model Runner V1.
-        from vllm_ascend.worker.v2.block_table import _compute_slot_mappings_kernel
-
         idx_mapping_np = self._as_numpy(idx_mapping)
         query_start_loc_np = self._as_numpy(query_start_loc)
         positions_np = self._as_numpy(positions)
         if query_start_loc_np.shape[0] < idx_mapping_np.shape[0] + 1:
             raise ValueError("query_start_loc does not contain all request boundaries.")
 
-        host_slots = self.slot_mappings_cpu
-        host_slots.fill_(PAD_SLOT_ID)
-        for group_id, (block_table, block_size) in enumerate(zip(self.block_tables_cpu, self.kernel_block_sizes)):
-            _compute_slot_mappings_kernel[(idx_mapping_np.shape[0] + 1,)](
-                host_slots.shape[1],
-                torch.from_numpy(idx_mapping_np),
-                torch.from_numpy(query_start_loc_np),
-                torch.from_numpy(positions_np),
-                block_table,
-                block_table.stride(0),
+        for group_id, block_size in enumerate(self.kernel_block_sizes):
+            _compute_group_slot_mappings(
+                self.block_tables_np[group_id],
+                idx_mapping_np,
+                query_start_loc_np,
+                positions_np,
                 block_size,
-                host_slots[group_id],
-                self.cp_rank,
-                CP_SIZE=self.cp_size,
-                CP_INTERLEAVE=self.cp_interleave,
-                PAD_ID=PAD_SLOT_ID,
-                TRITON_BLOCK_SIZE=1024,
-                TOTAL_BLOCK_SIZE=4096,
+                self.slot_mappings_np[group_id],
             )
 
         device_slots = self.slot_mappings if out is None else out
-        device_slots.copy_(host_slots, non_blocking=True)
+        device_slots.copy_(self.slot_mappings_cpu, non_blocking=True)
         return device_slots[:, :num_tokens_padded]
 
     def get_dummy_block_tables(self, num_reqs: int) -> tuple[torch.Tensor, ...]:

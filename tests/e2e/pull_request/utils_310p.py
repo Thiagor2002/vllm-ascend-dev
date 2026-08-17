@@ -1,8 +1,30 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+
 import os
 
 from PIL import Image
 
 from tests.e2e.conftest import VllmRunner
+
+HYBRID_MODELS = {
+    "Qwen/Qwen3.5-2B",
+    "Qwen/Qwen3.5-4B",
+    "Qwen/Qwen3.5-27B",
+    "Qwen/Qwen3.5-35B-A3B",
+}
+
+FULL_DECODE_ONLY_GRAPH = {
+    "cudagraph_mode": "FULL_DECODE_ONLY",
+    "cudagraph_capture_sizes": [1, 2, 4],
+}
+
+
+def hybrid_runner_kwargs(model: str) -> dict:
+    """Qwen3.5 hybrid models require fp16 Mamba/GDN state on 310P."""
+    if model in HYBRID_MODELS:
+        return {"mamba_ssm_cache_dtype": "float16"}
+    return {}
 
 
 def get_test_image():

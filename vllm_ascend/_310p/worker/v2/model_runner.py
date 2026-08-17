@@ -29,11 +29,13 @@ from vllm.v1.worker.gpu.kv_connector import get_kv_connector
 from vllm.v1.worker.utils import bind_kv_cache
 
 from vllm_ascend._310p.attention.attention_v1 import AscendAttentionBackend310
-
-# Register 310P kernel implementations only when the V2 runner is imported.
-from vllm_ascend._310p.worker.v2 import kernel_registry as kernel_registry
 from vllm_ascend._310p.worker.v2.aclgraph import ModelAclGraphManager310
 from vllm_ascend._310p.worker.v2.block_table import Ascend310PBlockTables
+from vllm_ascend._310p.worker.v2.feature_support import (
+    FIRST_RELEASE_FEATURE_SUPPORT,
+    MRv2FeatureSupport,
+)
+from vllm_ascend._310p.worker.v2.kernel_registry import register_310p_kernels
 from vllm_ascend._310p.worker.v2.kv_block_zeroer import AscendKVBlockZeroer310V2
 from vllm_ascend._310p.worker.v2.sampler import Ascend310PGreedySampler
 from vllm_ascend._310p.worker.v2.states import Ascend310PRequestState
@@ -41,6 +43,10 @@ from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch
 from vllm_ascend.worker.v2.model_runner import NPUModelRunner
 from vllm_ascend.worker.v2.pcp_manager import maybe_build_ascend_pcp_manager
+
+# Only the V2 runner opts into kernel dispatch, and only when vLLM provides a
+# dispatcher. Model Runner V1 never imports this module.
+register_310p_kernels()
 
 _ATTENTION_BLOCK_SIZE_LIMIT = 128 * 128
 
@@ -50,6 +56,7 @@ class NPUModelRunner310V2(NPUModelRunner):
 
     aclgraph_manager_cls = ModelAclGraphManager310
     request_state_cls = Ascend310PRequestState
+    feature_support: MRv2FeatureSupport = FIRST_RELEASE_FEATURE_SUPPORT
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self._validate_first_release_config(vllm_config)
@@ -59,8 +66,21 @@ class NPUModelRunner310V2(NPUModelRunner):
         self.positions_cpu = torch.zeros(self.max_num_tokens, dtype=torch.int64, device="cpu")
         self.next_prefill_tokens_cpu = torch.zeros(1, self.max_num_reqs, dtype=torch.int32, device="cpu")
 
-    @staticmethod
-    def _validate_first_release_config(vllm_config: VllmConfig) -> None:
+    @property
+    def supports_prefix_caching(self) -> bool:
+        return self.feature_support.prefix_caching
+
+    @property
+    def supports_qwen3_5_mtp(self) -> bool:
+        return self.feature_support.qwen3_5_mtp
+
+    @property
+    def supports_mtp(self) -> bool:
+        """Compatibility alias for callers that do not distinguish MTP models."""
+        return self.supports_qwen3_5_mtp
+
+    @classmethod
+    def _validate_first_release_config(cls, vllm_config: VllmConfig) -> None:
         parallel_config = vllm_config.parallel_config
         unsupported_parallel = {
             "pipeline_parallel_size": getattr(parallel_config, "pipeline_parallel_size", 1),
@@ -75,10 +95,7 @@ class NPUModelRunner310V2(NPUModelRunner):
                 f"unsupported parallel settings: {', '.join(enabled)}."
             )
 
-        if vllm_config.speculative_config is not None:
-            raise NotImplementedError("Speculative decoding is deferred to the second 310P Model Runner V2 release.")
-        if vllm_config.cache_config.enable_prefix_caching:
-            raise NotImplementedError("Prefix caching is deferred to the second 310P Model Runner V2 release.")
+        cls.feature_support.validate_config(vllm_config)
         if vllm_config.lora_config is not None:
             raise NotImplementedError("LoRA is outside the 310P Model Runner V2 V1-alignment scope.")
         if getattr(parallel_config, "enable_expert_parallel", False):
@@ -189,9 +206,7 @@ class NPUModelRunner310V2(NPUModelRunner):
             self.block_tables,
         )
 
-    def _adjust_kernel_block_sizes_310p(
-        self, kv_cache_config: KVCacheConfig
-    ) -> None:
+    def _adjust_kernel_block_sizes_310p(self, kv_cache_config: KVCacheConfig) -> None:
         """Apply the 310P paged-attention block/head-size constraint."""
         for group_id, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
             group_spec = kv_cache_group.kv_cache_spec
@@ -223,9 +238,7 @@ class NPUModelRunner310V2(NPUModelRunner):
                 )
             self.kernel_block_sizes[group_id] = supported_sizes[0]
 
-    def _init_kv_zero_meta_if_needed(
-        self, kv_cache_config: KVCacheConfig
-    ) -> None:
+    def _init_kv_zero_meta_if_needed(self, kv_cache_config: KVCacheConfig) -> None:
         """Initialize Mamba/GDN block zeroing for non-speculative hybrid models."""
         if kv_cache_config.needs_kv_cache_zeroing:
             self._init_kv_zero_meta()
@@ -283,9 +296,7 @@ class NPUModelRunner310V2(NPUModelRunner):
                 if isinstance(kv_cache_spec, AttentionSpec):
                     _, backend, kernel_block_size = cache_key
                     if not issubclass(backend, AscendAttentionBackend310):
-                        raise TypeError(
-                            f"310P attention layer {layer_name} selected unexpected backend {backend}."
-                        )
+                        raise TypeError(f"310P attention layer {layer_name} selected unexpected backend {backend}.")
                     blocks_per_kv_block = kv_cache_spec.block_size // kernel_block_size
                     kv_cache_shape = backend.get_kv_cache_shape(
                         num_blocks * blocks_per_kv_block,
@@ -294,13 +305,9 @@ class NPUModelRunner310V2(NPUModelRunner):
                         kv_cache_spec.head_size,
                         self.cache_config.cache_dtype,
                     )
-                    head_size_v = getattr(
-                        kv_cache_spec, "head_size_v", kv_cache_spec.head_size
-                    )
+                    head_size_v = getattr(kv_cache_spec, "head_size_v", kv_cache_spec.head_size)
                     if head_size_v != kv_cache_spec.head_size:
-                        raise NotImplementedError(
-                            "310P V2 does not support asymmetric K/V head sizes."
-                        )
+                        raise NotImplementedError("310P V2 does not support asymmetric K/V head sizes.")
                     k_shape = v_shape = kv_cache_shape[1:]
                     k_cache = torch_npu.empty_with_format(
                         size=k_shape,
@@ -316,9 +323,7 @@ class NPUModelRunner310V2(NPUModelRunner):
                     )
                     cache = (k_cache, v_cache)
                 elif isinstance(kv_cache_spec, MambaSpec):
-                    raw_tensor = torch.zeros(
-                        kv_cache_tensor.size, dtype=torch.int8, device=self.device
-                    )
+                    raw_tensor = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=self.device)
                     state_tensors = []
                     storage_offset_bytes = 0
                     for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):
@@ -338,9 +343,7 @@ class NPUModelRunner310V2(NPUModelRunner):
                         storage_offset_bytes += stride[0] * dtype_size
                     cache = state_tensors
                 else:
-                    raise NotImplementedError(
-                        f"Unsupported 310P KV cache spec: {type(kv_cache_spec).__name__}"
-                    )
+                    raise NotImplementedError(f"Unsupported 310P KV cache spec: {type(kv_cache_spec).__name__}")
 
                 for name in cache_layer_names:
                     kv_caches[name] = cache
@@ -546,9 +549,7 @@ class NPUModelRunner310V2(NPUModelRunner):
         self._copy_num_computed_tokens_to_cpu()
 
     def _init_kv_zero_meta(self) -> None:
-        self.kv_block_zeroer = AscendKVBlockZeroer310V2(
-            self.device, is_pin_memory_available()
-        )
+        self.kv_block_zeroer = AscendKVBlockZeroer310V2(self.device, is_pin_memory_available())
         self.kv_block_zeroer.init_meta(
             attn_groups_iter=(group for groups in self.attn_groups for group in groups),
             kernel_block_sizes=self.kernel_block_sizes,

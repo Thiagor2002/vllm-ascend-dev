@@ -62,7 +62,7 @@
 改动内容：
 
 - 新增 `NPUModelRunner310V2`，继承公共 `NPUModelRunner`。
-- 导入该 runner 时加载 `kernel_registry.py`，注册首版需要的 310P kernel 实现。
+- 导入该 runner 时调用 `register_310p_kernels()`；没有上游 dispatcher 时为 no-op。
 - 通过 `request_state_cls` 使用 `Ascend310PRequestState`。
 - 通过 `aclgraph_manager_cls` 使用 `ModelAclGraphManager310`。
 - 校验第一版配置范围，只允许 TP，暂不进入 prefix cache、MTP 和其他未适配路径。
@@ -76,56 +76,47 @@
 
 改动原因：
 
-- 上游输入准备、状态更新等路径仍包含未添加 `@pluggable_kernel` 的 Triton kernel，无法
-  通过 dispatcher 注册替换。
+- 上游输入准备、状态更新等路径包含 Triton kernel，310P 只能通过子类和类属性扩展点
+  替换。
 - 310P 已经能从 scheduler 获取 CPU metadata，应直接使用这些 mirror，避免从 NPU
   Tensor 反向 D2H。
 - 类级差异、RequestState 和 ACLGraph manager 不属于函数级 kernel dispatcher 的适用
   范围，需要通过继承和类属性扩展。
 
-## 4. 可插拔 Slot Mapping Kernel
+## 4. Triton Kernel Dispatcher 解耦
 
 ### `vllm_ascend/worker/v2/block_table.py`
 
 改动内容：
 
-- 在 vLLM Ascend 自有 `_compute_slot_mappings_kernel` 前增加：
-
-  ```python
-  @pluggable_kernel
-  @triton.jit
-  ```
-
-- 将 kernel ABI 从多 cache group raw-pointer 数组调整为单 cache group、显式
-  block-table Tensor。
-- `AscendBlockTables.compute_slot_mappings()` 按 cache group 调用该 kernel。
-- 没有平台注册实现时仍执行默认 Triton kernel。
+- 不改动该文件，保持与主线一致：默认 `_compute_slot_mappings_kernel` 仍是多 cache
+  group raw-pointer ABI，也不添加 `@pluggable_kernel`。
 
 改动原因：
 
-- PR #43048 的 dispatcher 只能替换显式添加 `@pluggable_kernel` 的对象。
-- 原 raw-pointer ABI 无法让 310P Python/PyTorch 注册函数访问实际 block-table Tensor。
-- 使用显式 Tensor 参数后，默认 Triton 实现和 310P 原生实现可以共享
-  `kernel[grid](...)` 调用形式。
+- [vLLM PR #43048](https://github.com/vllm-project/vllm/pull/43048) 尚未合入主线，导入
+  `vllm.model_executor.triton_dispatcher` 会让插件在主线 vLLM 上 `ImportError`。
+- 310P 通过 `patch_v2/patch_block_table.py` 整类替换 BlockTables，不需要函数级分发，
+  公共 kernel 因此没有改 ABI 的理由。
+- 保持 ABI 不变也让 910B/910C 的单次 kernel launch 行为和
+  `tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_compute_slot_mapping.py`
+  继续有效。
 
 ### `vllm_ascend/_310p/worker/v2/kernel_registry.py`
 
 改动内容：
 
-- 使用 `register_kernel()` 注册以下全限定名：
-
-  ```text
-  vllm_ascend.worker.v2.block_table._compute_slot_mappings_kernel
-  ```
-
-- 提供 CPU/PyTorch slot-mapping 实现。
-- 注册函数保持与默认 Triton kernel 相同的参数语义，并接收 dispatcher 传入的 `grid`。
-- 根据 token position、block size 和物理 block number 生成 slot ID。
+- 以 `try/except ImportError` 探测 `vllm.model_executor.triton_dispatcher`，导出
+  `HAS_TRITON_DISPATCHER`。
+- 提供 `KERNEL_IMPLS`（kernel 全限定名 → 310P 实现）和 `register_310p_kernels()`。
+- 首版 `KERNEL_IMPLS` 为空，`register_310p_kernels()` 为 no-op 并返回空元组。
 
 改动原因：
 
-- 310P 不执行 Triton，需要在不修改 vLLM 上游的前提下替换 vLLM Ascend 自有 kernel。
-- registry 只在真正导入 310P V2 runner 时加载，避免影响 V1。
+- 310P 首版可达的 Triton 路径在上游都没有 `@pluggable_kernel`，只能通过类/模块级替换
+  覆盖，dispatcher 无法减少这些改动。
+- 保留唯一接入点：PR #43048 合入后只需登记 kernel 名与实现，调用侧保持
+  `kernel[grid](...)`，并可删除对应子类覆写；未合入时不产生任何导入依赖。
 
 ## 5. 310P BlockTables
 
@@ -138,19 +129,21 @@
 - `append_block_ids()` 直接更新 CPU block table。
 - `gather_block_tables()` 根据 request index 在 CPU 聚合输入 block table，再复制到固定的
   NPU buffer。
-- `compute_slot_mappings()` 调用可插拔 slot-mapping kernel；310P 实际进入 registry 中的
-  CPU/PyTorch 实现。
+- `compute_slot_mappings()` 调用同文件内的 `_compute_group_slot_mappings()`，按 cache
+  group 用 NumPy 生成 slot ID，再一次性 H2D。
+- CPU owner tensor 同时保存 NumPy 视图，避免每步重新包装。
 - 支持多个 KV cache group。
 - dummy block table 和 slot mapping 复用持久化 NPU Tensor，保持 ACLGraph 所需的固定
   地址。
-- 默认 Triton kernel 在 `compute_slot_mappings()` 内延迟导入。
+- 不导入 `vllm_ascend/worker/v2/block_table.py`，UT 对该约束做静态校验。
 
 改动原因：
 
-- 上游 BlockTables 的 staged write 和 gather kernel 尚未提供 dispatcher，不能只替换
-  slot-mapping kernel。
-- CPU owner 可以直接消费 scheduler metadata，避免热路径 D2H。
-- 延迟导入确保仅加载该类不会给 V1 引入 dispatcher 或 Triton kernel 定义。
+- 上游 BlockTables 的 staged write、gather 和 slot mapping 都是 Triton 实现，310P 需要整
+  类替换，而不是替换单个 kernel。
+- CPU owner 可以直接消费 scheduler metadata，避免热路径 D2H；NumPy 实现与 310P Model
+  Runner V1 的 slot mapping 算法一致。
+- 不导入公共 V2 block table，确保 310P 进程不会执行该模块的 `@triton.jit` 定义。
 
 ### `vllm_ascend/patch/worker/patch_v2/patch_block_table.py`
 
@@ -161,8 +154,8 @@
 
 改动原因：
 
-- 310P 必须替换上游 BlockTables 中尚未开放 dispatcher 的 staged-write 和 gather
-  Triton 路径。
+- 310P 必须整类替换上游 BlockTables 的 staged-write、gather 和 slot-mapping Triton
+  路径。
 - patch 目标属于 Model Runner V2，不改变 310P Model Runner V1 使用的 BlockTables。
 
 ## 6. RequestState 和 Staged Write
@@ -181,7 +174,7 @@
 
 改动原因：
 
-- 上游 `StagedWriteTensor.apply_write()` 使用未开放 dispatcher 的 Triton kernel。
+- 上游 `StagedWriteTensor.apply_write()` 使用 Triton kernel，且没有函数级替换入口。
 - RequestState 是 prefill、decode、chunked prefill 和 ACLGraph 的公共基础，310P 必须提供
   无 Triton 的状态更新路径。
 
@@ -200,7 +193,7 @@
 
 改动原因：
 
-- 上游多维 RoPE position 准备使用未开放 dispatcher 的 Triton kernel。
+- 上游多维 RoPE position 准备使用 Triton kernel，只能通过 RoPE state 子类替换。
 - Qwen3-VL 首版多模态适配需要无 Triton MRoPE 路径。
 
 ### `vllm_ascend/_310p/worker/v2/model_state.py`
@@ -248,7 +241,7 @@
 
 - Qwen3.5-4B 同时包含 Full Attention 和 GDN/Mamba layer，需要 hybrid cache metadata。
 - 上游 metadata builder 不包含 Ascend Attention backend 需要的扩展字段。
-- 上游 accepted-token scatter kernel 尚未开放 dispatcher。
+- 上游 accepted-token scatter 是 Triton kernel，需要 310P 侧提供等价实现。
 
 ## 9. Greedy Sampling
 
@@ -313,9 +306,9 @@
 
 改动原因：
 
-- 上游 `VllmConfig` 在 Worker 创建前要求 `HAS_TRITON=True`，导致 310P 即使已经注册
-  非 Triton kernel 实现也无法完成配置创建。
-- dispatcher 不会自动移除该配置校验，因此必须由 Ascend 平台只针对 310P 接管。
+- 上游 `VllmConfig` 在 Worker 创建前要求 `HAS_TRITON=True`，导致 310P 即使已经提供
+  非 Triton 实现也无法完成配置创建。
+- 该校验独立于任何 kernel 替换机制，必须由 Ascend 平台只针对 310P 接管。
 - 只跳过 Triton 条件而不跳过其他 feature gate，避免放开上游尚未支持的 V2 配置。
 
 ### `vllm_ascend/worker/v2/model_runner.py`
@@ -332,8 +325,7 @@
 
 改动原因：
 
-- 这些调用最终进入 vLLM 上游未添加 `@pluggable_kernel` 的 Triton kernel，当前无法使用
-  dispatcher 替换。
+- 这些调用最终进入 vLLM 上游的 Triton kernel，只能在 runner 层提供可覆盖方法。
 - 310P 需要使用 scheduler CPU mirror 准备输入，不能从 device Tensor 反向 D2H。
 - 非 310P 默认实现仍调用原来的上游函数，保持原有调用语义。
 
@@ -753,8 +745,7 @@ attn_metadata.seq_lens = attn_metadata.seq_lens.to(
   `AscendMambaHybridModelState`，因此没有进入已有的 310P
   `Ascend310PModelState/Ascend310PRopeState` 路径。
 - 公共 hybrid state 继承上游 `DefaultModelState`，其 `RopeState.prepare_positions()`
-  调用未注册 pluggable dispatcher 的上游 Triton kernel。310P 替换得到的是普通 Python
-  function，不能继续使用 Triton 的 `kernel[grid](...)` 调用语法。
+  调用上游 Triton kernel，310P 无法执行。
 - 不能简单让所有 310P 模型都返回默认 `Ascend310PModelState`，否则会丢失 GDN/Mamba
   metadata、`num_accepted_tokens_gpu` 和 hybrid 后处理语义。
 
@@ -1157,3 +1148,75 @@ MRV1 对照：
 
 - 需要在真实310P上重新验证 Qwen3.5-4B eager首token、连续decode和多请求场景。
 - eager精度恢复后，再继续验证 ACLGraph、TP和并发场景。
+
+## 32. 第一版合入准备：测试矩阵与文档入口
+
+改动内容：
+
+- `tests/e2e/pull_request/one_card/_310p/test_model_runner_v2_310p.py`
+  - dense/hybrid 参数化增加 `Qwen3.5-2B`。
+  - VL 增加 `Qwen3-VL-2B-Instruct`，并补 `FULL_DECODE_ONLY` 图模式（encoder eager、decode 捕获）。
+- `tests/e2e/pull_request/four_card/_310p/test_model_runner_v2_310p.py`
+  - 同步 TP2 dense/hybrid/VL；新增 TP2 W8A8 图模式与 Qwen3.5-27B TP4 图模式。
+- `tests/e2e/pull_request/four_card/_310p/test_model_runner_v2_moe_310p.py`
+  - 新增 Qwen3-30B-A3B TP2 eager/图、Qwen3.5-35B-A3B TP4 eager/图。
+- `tests/ut/_310p/quantization/test_w8a8sc_310.py`
+  - 覆盖 row-parallel `tp_rank != 0` 时 quant_bias 置零。
+- `_310p/quantization/modelslim_config.py`
+  - 静态 W8A8/W8A8SC MoE 启动失败时给出 W8A8_DYNAMIC 指引。
+- `docs/source/developer_guide/Design_Documents/ModelRunner_v2_310P_pr_notes.md`
+  - 新增社区合入注释：改动结构、支持矩阵、测试清单、评审清单。
+
+改动原因：
+
+- 第一版验收面从 Qwen3-Dense 扩展到 VL/MoE/Qwen3.5，需要对应 E2E 而不是只依赖手工 serve。
+- 合入文档需要英文入口，方便社区评审对照文件与门禁，而不是只保留联调过程记录。
+
+未纳入本轮：
+
+- 临时精度 A/B 开关已移除；W8A8-Dynamic 的 int8 activation、Dense 权重布局和
+  MoE `[E,K,N]` grouped-matmul 布局现在是固定代码契约。真实检查点精度仍需在
+  310P 服务器上按验收矩阵确认。
+- Prefix cache / MTP 的阶段开关环境变量（第一版保持启动拒绝）。
+
+## 33. 去除对未合入 Triton dispatcher 的依赖
+
+问题现象：
+
+- 分支代码在导入期依赖 `vllm.model_executor.triton_dispatcher`，而
+  [vLLM PR #43048](https://github.com/vllm-project/vllm/pull/43048) 至今未合入主线，
+  在主线 vLLM 上 `import vllm_ascend.worker.v2.block_table` 和
+  `tests/ut/_310p/test_model_runner_v2_310p.py` 都会 `ImportError`。
+- 为配合 dispatcher ABI，公共 `_compute_slot_mappings_kernel` 曾从多 cache group
+  raw-pointer 改为单 cache group Tensor，导致主线已有的
+  `tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_compute_slot_mapping.py`
+  参数不再匹配，也让 910B/910C 由单次 launch 变成按 cache group 逐次 launch。
+
+修改内容：
+
+- `vllm_ascend/worker/v2/block_table.py`
+  - 回退到主线实现：无 `@pluggable_kernel`，保留原 raw-pointer ABI 与单次 launch。
+- `vllm_ascend/_310p/worker/v2/block_table.py`
+  - 新增模块级 `_compute_group_slot_mappings()`，用 NumPy 生成 slot ID，算法与 310P
+    Model Runner V1 的 `_compute_slot_mapping_numpy()` 一致。
+  - `compute_slot_mappings()` 直接调用该函数，不再延迟导入公共 Triton kernel。
+  - CPU owner tensor 增加 NumPy 视图（`block_tables_np` 等），gather 与 slot mapping
+    共用，避免每步重复 `tensor.numpy()`。
+- `vllm_ascend/_310p/worker/v2/kernel_registry.py`
+  - 改为可选接入点：`try/except ImportError` 探测 dispatcher，导出
+    `HAS_TRITON_DISPATCHER`、`KERNEL_IMPLS` 和 `register_310p_kernels()`。
+  - 首版 `KERNEL_IMPLS` 为空，注册函数是 no-op。
+- `vllm_ascend/_310p/worker/v2/model_runner.py`
+  - 由“导入 registry 触发副作用”改为显式调用 `register_310p_kernels()`。
+- `tests/ut/_310p/test_model_runner_v2_310p.py`
+  - 删除 `_get_kernel_impl` 断言，改为校验无 dispatcher 时注册为 no-op。
+  - 新增静态校验：310P V2 BlockTables 不导入任何 triton 模块，也不导入公共 V2
+    block table。
+  - 新增多 cache group slot mapping 与空 batch padding 用例。
+
+改动原因：
+
+- 插件不能依赖未合入的上游 API；310P 已经通过 `patch_v2/patch_block_table.py` 整类
+  替换 BlockTables，函数级 dispatcher 对第一版没有增量价值。
+- 公共 kernel 保持主线形态，910B/910C 行为和既有 nightly 用例都不受 310P 适配影响。
+- dispatcher 合入后仍可在 `kernel_registry.py` 一处接入，无需回改调用侧。

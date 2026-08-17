@@ -155,8 +155,11 @@ class AscendW8A8DynamicFusedMoEMethod310(AscendMoEScheme):
         return final_hidden_states
 
     def process_weights_after_loading(self, layer):
-        layer.w13_weight.data = maybe_trans_nz(layer.w13_weight.data)
-        layer.w2_weight.data = maybe_trans_nz(layer.w2_weight.data)
+        # The grouped matmul consumes [E, K, N]. ModelSlim checkpoints store
+        # expert weights as [E, N, K], so move the output dimension last before
+        # converting to FRACTAL_NZ.
+        layer.w13_weight.data = maybe_trans_nz(layer.w13_weight.data.transpose(1, 2).contiguous())
+        layer.w2_weight.data = maybe_trans_nz(layer.w2_weight.data.transpose(1, 2).contiguous())
         layer.w13_weight_scale.data = layer.w13_weight_scale.data.view(layer.w13_weight_scale.data.shape[0], -1)
         layer.w13_weight_offset.data = layer.w13_weight_offset.data.view(layer.w13_weight_offset.data.shape[0], -1)
         layer.w2_weight_scale.data = layer.w2_weight_scale.data.view(layer.w2_weight_scale.data.shape[0], -1)
@@ -170,6 +173,8 @@ class AscendW8A8DynamicLinearMethod310(AscendW8A8Linear310pScheme):
     Notes:
       - This scheme is discovered via 310P local registry.
     """
+
+    act_quant_type: torch.dtype = torch.int8
 
     def get_perchannel_param(
         self,
@@ -188,9 +193,7 @@ class AscendW8A8DynamicLinearMethod310(AscendW8A8Linear310pScheme):
         bias: torch.Tensor | None = None,
         tp_rank: int | None = 0,
     ) -> torch.Tensor:
-        # NOTE(310P):
-        # - There is an accuracy issue currently, which is expected to be fixed in the next version.
-        quantized_x, pertoken_scale = torch_npu.npu_dynamic_quant(x)
+        quantized_x, pertoken_scale = torch_npu.npu_dynamic_quant(x, dst_type=self.act_quant_type)
         need_unsqz = False
         if pertoken_scale.dim() == 2:
             need_unsqz = True
