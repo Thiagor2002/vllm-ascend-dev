@@ -40,13 +40,13 @@ def _patched_use_v2_model_runner(self) -> bool:
 
 
 def _patched_validate_v2_model_runner(self) -> None:
-    """Allow 310P to use registered non-Triton V2 kernel implementations."""
+    """Allow 310P to use its local non-Triton V2 implementations."""
     if not is_310p():
         _ORIGINAL_VALIDATE_V2_MODEL_RUNNER(self)
         return
 
     # Keep upstream feature validation. Only the global HAS_TRITON check is
-    # platform-specific: 310P replaces each reachable pluggable kernel and
+    # platform-specific: 310P replaces reachable Triton-backed classes and
     # rejects unsupported first-release features in NPUModelRunner310V2.
     unsupported = self._get_v2_model_runner_unsupported_features()
     if unsupported:

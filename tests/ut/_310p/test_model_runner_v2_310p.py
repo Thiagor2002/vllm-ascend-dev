@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 
+import ast
+import inspect
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -8,13 +10,17 @@ import numpy as np
 import pytest
 import torch
 from vllm.config.compilation import CUDAGraphMode
-from vllm.model_executor.triton_dispatcher import _get_kernel_impl
 from vllm.sampling_params import SamplingParams
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 
 from vllm_ascend._310p.attention.attention_v1 import AscendAttentionBackend310
+from vllm_ascend._310p.worker.v2 import block_table as block_table_module
 from vllm_ascend._310p.worker.v2.block_table import Ascend310PBlockTables
 from vllm_ascend._310p.worker.v2.feature_support import MRv2FeatureSupport
+from vllm_ascend._310p.worker.v2.kernel_registry import (
+    KERNEL_IMPLS,
+    register_310p_kernels,
+)
 from vllm_ascend._310p.worker.v2.model_runner import NPUModelRunner310V2
 from vllm_ascend._310p.worker.v2.model_state import (
     Ascend310PMambaHybridModelState,
@@ -28,10 +34,27 @@ from vllm_ascend.worker.v2.model_states.default import AscendModelState
 from vllm_ascend.worker.v2.model_states.mamba_hybrid import AscendMambaHybridModelState
 
 
-def test_310p_slot_mapping_kernel_is_registered() -> None:
-    kernel_name = "vllm_ascend.worker.v2.block_table._compute_slot_mappings_kernel"
+def test_310p_v2_has_no_required_kernel_dispatcher_registration() -> None:
+    assert KERNEL_IMPLS == {}
+    assert register_310p_kernels() == ()
 
-    assert _get_kernel_impl(kernel_name) is not None
+
+def test_310p_block_tables_do_not_import_triton_or_shared_v2_kernel() -> None:
+    tree = ast.parse(inspect.getsource(block_table_module))
+    imported_modules = {
+        node.module
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module is not None
+    }
+    imported_modules.update(
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    )
+
+    assert not any("triton" in module for module in imported_modules)
+    assert "vllm_ascend.worker.v2.block_table" not in imported_modules
 
 
 def test_310p_v2_config_validation_skips_upstream_triton_gate() -> None:

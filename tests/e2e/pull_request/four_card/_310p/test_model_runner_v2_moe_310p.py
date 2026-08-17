@@ -28,8 +28,10 @@ def test_model_runner_v2_qwen3_moe_tp2_eager():
         enable_prefix_caching=False,
     ) as vllm_model:
         outputs = vllm_model.generate_greedy(example_prompts, max_tokens)
+        follow_up_outputs = vllm_model.generate_greedy(["Count to two."], max_tokens=2)
 
     assert outputs[0][0]
+    assert follow_up_outputs[0][0]
 
 
 @patch.dict(os.environ, {"VLLM_USE_V2_MODEL_RUNNER": "1"})
@@ -53,8 +55,10 @@ def test_model_runner_v2_qwen3_moe_tp2_aclgraph():
         },
     ) as vllm_model:
         outputs = vllm_model.generate_greedy(example_prompts, max_tokens)
+        follow_up_outputs = vllm_model.generate_greedy(["Count to two."], max_tokens=2)
 
     assert outputs[0][0]
+    assert follow_up_outputs[0][0]
 
 
 @patch.dict(os.environ, {"VLLM_USE_V2_MODEL_RUNNER": "1"})
@@ -77,8 +81,10 @@ def test_model_runner_v2_qwen3_moe_w8a8_dynamic_tp2_aclgraph():
         },
     ) as vllm_model:
         outputs = vllm_model.generate_greedy(["Hello, my name is"], max_tokens=5)
+        follow_up_outputs = vllm_model.generate_greedy(["Count to two."], max_tokens=2)
 
     assert outputs[0][0]
+    assert follow_up_outputs[0][0]
 
 
 @patch.dict(os.environ, {"VLLM_USE_V2_MODEL_RUNNER": "1"})
@@ -99,8 +105,10 @@ def test_model_runner_v2_qwen3_5_moe_tp4_eager():
         **hybrid_runner_kwargs("Qwen/Qwen3.5-35B-A3B"),
     ) as vllm_model:
         outputs = vllm_model.generate_greedy(example_prompts, max_tokens)
+        follow_up_outputs = vllm_model.generate_greedy(["Count to two."], max_tokens=2)
 
     assert outputs[0][0]
+    assert follow_up_outputs[0][0]
 
 
 @patch.dict(os.environ, {"VLLM_USE_V2_MODEL_RUNNER": "1"})
@@ -125,5 +133,7 @@ def test_model_runner_v2_qwen3_5_moe_tp4_aclgraph():
         **hybrid_runner_kwargs("Qwen/Qwen3.5-35B-A3B"),
     ) as vllm_model:
         outputs = vllm_model.generate_greedy(example_prompts, max_tokens)
+        follow_up_outputs = vllm_model.generate_greedy(["Count to two."], max_tokens=2)
 
     assert outputs[0][0]
+    assert follow_up_outputs[0][0]

@@ -207,7 +207,7 @@ class AscendW8A8DynamicLinearMethod310(AscendW8A8Linear310pScheme):
             layer.weight.data,
             layer.weight_scale,
             pertoken_scale=pertoken_scale,
-            bias=bias,
+            bias=bias if tp_rank == 0 else None,
             output_dtype=x.dtype,
         )
         if need_unsqz:

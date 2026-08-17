@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 
-import os
-
 from PIL import Image
 
 from tests.e2e.conftest import VllmRunner
@@ -27,10 +25,9 @@ def hybrid_runner_kwargs(model: str) -> dict:
     return {}
 
 
-def get_test_image():
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    image_path = os.path.join(current_dir, "..", "prompts", "qwen.png")
-    return Image.open(image_path)
+def get_test_image() -> Image.Image:
+    """Build a deterministic image without relying on an external test asset."""
+    return Image.new("RGB", (224, 224), color=(32, 96, 160))
 
 
 def get_test_prompts():
@@ -56,4 +53,8 @@ def run_vl_model_test(
         dtype=dtype,
         **runner_kwargs,
     ) as vllm_model:
-        vllm_model.generate_greedy(prompts, max_tokens, images=images)
+        outputs = vllm_model.generate_greedy(prompts, max_tokens, images=images)
+        follow_up_outputs = vllm_model.generate_greedy(prompts, max_tokens, images=images)
+
+    assert outputs and all(output[0] for output in outputs)
+    assert follow_up_outputs and all(output[0] for output in follow_up_outputs)

@@ -11,12 +11,12 @@ reaches is replaced at class or module level instead:
 * ``Ascend310PBlockTables`` computes gather and slot mapping in NumPy;
 * ``Ascend310PRequestState`` owns staged writes on CPU;
 * ``Ascend310PRopeState`` builds multimodal positions on CPU;
-* ``patch/worker/patch_v2/patch_triton.py`` swaps the sampling kernels.
+* ``Ascend310PGreedySampler`` avoids the upstream sampling kernels.
 
-This module keeps the dispatcher path alive for the day that PR lands: add the
-fully qualified kernel name and its 310P implementation to ``KERNEL_IMPLS``,
-and the override takes effect at the shared ``kernel[grid](...)`` call site so
-the corresponding subclass override can be dropped.
+This module keeps the dispatcher path alive for the day that PR lands and the
+relevant upstream kernel is marked pluggable: add its fully qualified name and
+310P implementation to ``KERNEL_IMPLS``, then the override takes effect at the
+shared ``kernel[grid](...)`` call site.
 """
 
 from __future__ import annotations

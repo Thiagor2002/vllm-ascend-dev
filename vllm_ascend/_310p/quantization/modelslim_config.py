@@ -139,7 +139,7 @@ class AscendModelSlimConfig310(AscendModelSlimConfig):
                 return AscendUnquantizedFusedMoEMethod310(layer.moe_config)
             scheme = create_scheme_for_layer(self.quant_description, prefix, "moe", self.packed_modules_mapping)
             logger.debug("Select AscendFusedMoEMethod for %s (layer=%s)", prefix, "FusedMoE")
-            return AscendFusedMoEMethod(scheme, layer.moe_config)
+            return AscendFusedMoEMethod(scheme, layer.moe_config, tid2eid)
 
         elif isinstance(layer, VocabParallelEmbedding):
             from vllm_ascend._310p.ops.vocab_parallel_embedding import AscendUnquantizedEmbeddingMethod310

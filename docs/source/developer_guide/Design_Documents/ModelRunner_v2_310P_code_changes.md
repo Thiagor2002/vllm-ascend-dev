@@ -1157,13 +1157,20 @@ MRV1 对照：
   - dense/hybrid 参数化增加 `Qwen3.5-2B`。
   - VL 增加 `Qwen3-VL-2B-Instruct`，并补 `FULL_DECODE_ONLY` 图模式（encoder eager、decode 捕获）。
 - `tests/e2e/pull_request/four_card/_310p/test_model_runner_v2_310p.py`
-  - 同步 TP2 dense/hybrid/VL；新增 TP2 W8A8 图模式与 Qwen3.5-27B TP4 图模式。
+  - 同步 TP2 dense/hybrid/VL；新增 TP2 W8A8 图模式、Qwen3.5-27B TP4 图模式和
+    Qwen3-Embedding-8B TP2 pooling 图模式。
 - `tests/e2e/pull_request/four_card/_310p/test_model_runner_v2_moe_310p.py`
   - 新增 Qwen3-30B-A3B TP2 eager/图、Qwen3.5-35B-A3B TP4 eager/图。
+- 上述文本、VL、量化和 MoE 用例在同一 runner 内连续发送第二个请求，覆盖首请求完成后的
+  request-state 清理、block-table condense 和 ACL Graph replay。
 - `tests/ut/_310p/quantization/test_w8a8sc_310.py`
   - 覆盖 row-parallel `tp_rank != 0` 时 quant_bias 置零。
+- `_310p/quantization/methods/w8a8_dynamic.py`
+  - MoE 权重在 NZ 转换前统一为 `[E,K,N]`。
+  - dynamic linear 在 row-parallel 非 0 rank 不重复应用 bias。
 - `_310p/quantization/modelslim_config.py`
   - 静态 W8A8/W8A8SC MoE 启动失败时给出 W8A8_DYNAMIC 指引。
+  - 将 `tid2eid` 继续传给 MoE quant method，保留专家映射语义。
 - `docs/source/developer_guide/Design_Documents/ModelRunner_v2_310P_pr_notes.md`
   - 新增社区合入注释：改动结构、支持矩阵、测试清单、评审清单。
 

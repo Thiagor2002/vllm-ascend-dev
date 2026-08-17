@@ -30,8 +30,10 @@ def test_model_runner_v2_tp2_chunked_prefill_aclgraph(model: str) -> None:
         **hybrid_runner_kwargs(model),
     ) as runner:
         outputs = runner.generate_greedy(prompts, max_tokens=4)
+        follow_up_outputs = runner.generate_greedy(["Give one short greeting."], max_tokens=2)
 
     assert all(output[0] for output in outputs)
+    assert follow_up_outputs[0][0]
 
 
 @patch.dict(os.environ, {"VLLM_USE_V2_MODEL_RUNNER": "1"})
@@ -56,8 +58,10 @@ def test_model_runner_v2_tp2_quantized_aclgraph(model: str) -> None:
         },
     ) as runner:
         outputs = runner.generate_greedy(["Hello, my name is"], max_tokens=4)
+        follow_up_outputs = runner.generate_greedy(["Count to two."], max_tokens=2)
 
     assert outputs[0][0]
+    assert follow_up_outputs[0][0]
 
 
 @patch.dict(os.environ, {"VLLM_USE_V2_MODEL_RUNNER": "1"})
@@ -77,8 +81,28 @@ def test_model_runner_v2_qwen3_5_27b_tp4_aclgraph() -> None:
         **hybrid_runner_kwargs("Qwen/Qwen3.5-27B"),
     ) as runner:
         outputs = runner.generate_greedy(["Hello, my name is"], max_tokens=4)
+        follow_up_outputs = runner.generate_greedy(["Give one short greeting."], max_tokens=2)
 
     assert outputs[0][0]
+    assert follow_up_outputs[0][0]
+
+
+@patch.dict(os.environ, {"VLLM_USE_V2_MODEL_RUNNER": "1"})
+def test_model_runner_v2_qwen3_embedding_8b_tp2_aclgraph() -> None:
+    queries = ["What is the capital of China?", "Explain gravity"]
+    with VllmRunner(
+        "Qwen/Qwen3-Embedding-8B",
+        runner="pooling",
+        tensor_parallel_size=2,
+        dtype="float16",
+        max_model_len=512,
+        enable_prefix_caching=False,
+        cudagraph_capture_sizes=[2],
+    ) as runner:
+        embeddings = runner.embed(queries)
+
+    assert len(embeddings) == len(queries)
+    assert all(embedding for embedding in embeddings)
 
 
 @patch.dict(os.environ, {"VLLM_USE_V2_MODEL_RUNNER": "1"})

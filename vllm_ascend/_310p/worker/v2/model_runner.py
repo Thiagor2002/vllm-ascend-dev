@@ -44,8 +44,8 @@ from vllm_ascend.worker.v2.input_batch import AscendInputBatch
 from vllm_ascend.worker.v2.model_runner import NPUModelRunner
 from vllm_ascend.worker.v2.pcp_manager import maybe_build_ascend_pcp_manager
 
-# Only the V2 runner opts into kernel dispatch, and only when vLLM provides a
-# dispatcher. Model Runner V1 never imports this module.
+# Probe the optional future dispatcher only when the 310P V2 runner is loaded.
+# Model Runner V1 never imports this module.
 register_310p_kernels()
 
 _ATTENTION_BLOCK_SIZE_LIMIT = 128 * 128

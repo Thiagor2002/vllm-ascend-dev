@@ -31,8 +31,10 @@ def test_model_runner_v2_tp1_chunked_prefill_aclgraph(model: str) -> None:
         **hybrid_runner_kwargs(model),
     ) as runner:
         outputs = runner.generate_greedy(prompts, max_tokens=4)
+        follow_up_outputs = runner.generate_greedy(["Give one short greeting."], max_tokens=2)
 
     assert all(output[0] for output in outputs)
+    assert follow_up_outputs[0][0]
 
 
 @patch.dict(os.environ, {"VLLM_USE_V2_MODEL_RUNNER": "1"})
@@ -59,8 +61,10 @@ def test_model_runner_v2_tp1_quantized_nz(model: str) -> None:
         },
     ) as runner:
         outputs = runner.generate_greedy(["Hello, my name is"], max_tokens=4)
+        follow_up_outputs = runner.generate_greedy(["Count to two."], max_tokens=2)
 
     assert outputs[0][0]
+    assert follow_up_outputs[0][0]
 
 
 @patch.dict(os.environ, {"VLLM_USE_V2_MODEL_RUNNER": "1"})
