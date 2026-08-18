@@ -1168,6 +1168,8 @@ MRV1 对照：
 - `_310p/quantization/methods/w8a8_dynamic.py`
   - MoE 权重在 NZ 转换前统一为 `[E,K,N]`。
   - dynamic linear 在 row-parallel 非 0 rank 不重复应用 bias。
+  - 310P dynamic **linear** 保持 ND `[N,K]` 并反量化到 fp16：GE 图模式会把
+    NZ `[K,N]` 重铺成 `QuantBatchMatmulV3_NZ_NZ` kernel 21（Qwen3.5-2B TP2）。
 - `_310p/quantization/modelslim_config.py`
   - 静态 W8A8/W8A8SC MoE 启动失败时给出 W8A8_DYNAMIC 指引。
   - 将 `tid2eid` 继续传给 MoE quant method，保留专家映射语义。
@@ -1181,9 +1183,9 @@ MRV1 对照：
 
 未纳入本轮：
 
-- 临时精度 A/B 开关已移除；W8A8-Dynamic 的 int8 activation、Dense 权重布局和
-  MoE `[E,K,N]` grouped-matmul 布局现在是固定代码契约。真实检查点精度仍需在
-  310P 服务器上按验收矩阵确认。
+- 临时精度 A/B 开关已移除；W8A8-Dynamic **MoE** 仍使用 `[E,K,N]` grouped-matmul
+  NZ。Dense linear 在 310P 上改为 ND fp16 dequant，避免 GE 编译
+  `QuantBatchMatmulV3_NZ_NZ`。真实检查点精度仍需在 310P 服务器上按验收矩阵确认。
 - Prefix cache / MTP 的阶段开关环境变量（第一版保持启动拒绝）。
 
 ## 33. 去除对未合入 Triton dispatcher 的依赖
@@ -1227,3 +1229,31 @@ MRV1 对照：
   替换 BlockTables，函数级 dispatcher 对第一版没有增量价值。
 - 公共 kernel 保持主线形态，910B/910C 行为和既有 nightly 用例都不受 310P 适配影响。
 - dispatcher 合入后仍可在 `kernel_registry.py` 一处接入，无需回改调用侧。
+
+## 34. Qwen3.5-2B-W8A8 图模式 QuantBatchMatmulV3 故障
+
+问题现象：
+
+- Qwen3.5-2B-W8A8 TP2 + `FULL_DECODE_ONLY` 在 `profile_run` 触发
+  `QuantBatchMatmulV3_NZ_NZ_int8_int8_fp16_high_performance_21`
+  （hash `5247287448945562503`）。Eager 同检查点可跑通。
+- Qwen3.5-4B-W8A8 / 9B-W8A8 TP2 图模式原本即可跑通。
+
+根因：
+
+- 310P dynamic linear 把权重存成 format-29 的 `[K,N]`（NZ(`[N,K]`) 再 transpose）。
+- Eager `npu_quant_matmul` 接受该布局；GE/`torch.compile` 会按 `[K,N]` 重新 NZ
+  铺砖，打到 kernel 21。2B fused `qkv_proj` 的 KV shard 为 N=256，4B/9B 为 N=512。
+
+修改：
+
+- `_310p/quantization/methods/w8a8_dynamic.py` 的 **linear** 方案改为保持 ND
+  `[N,K]`，int8×scale 反量化后走 `F.linear`。MoE grouped-matmul NZ 不变。
+- `quantization/modelslim_config.py` 拒绝 MLX/JANG 的 `bits`+`group_size`
+  配置，避免误入 Ascend ModelSlim。
+
+验证：
+
+- Qwen3.5-2B-W8A8 TP2 图模式两次 curl 200，decode 走 ACL Graph `num_tokens=1`。
+- 改动后复测 Qwen3.5-9B-W8A8 TP2 图模式，两次 curl 200。
+

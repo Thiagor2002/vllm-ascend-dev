@@ -19,7 +19,6 @@ from collections.abc import Callable
 from typing import Any
 
 import torch
-import torch_npu
 from vllm.config import get_current_vllm_config
 from vllm.distributed import get_ep_group
 
@@ -32,6 +31,24 @@ from vllm_ascend.utils import maybe_trans_nz
 
 from .registry import register_scheme
 from .w8a8_base import AscendW8A8Linear310pScheme
+
+# 310P GE retile of FRACTAL_NZ W8A8-Dynamic weights during torch.compile
+# launches QuantBatchMatmulV3_NZ_NZ kernel 21 (hash 5247287448945562503).
+# Eager NZ works; compiled Qwen3.5-2B TP2 does not (fused qkv KV shard N=256
+# and MLP). Linear layers keep ND [N, K] and dequant to fp16. MoE experts
+# still use grouped-matmul NZ.
+_MIN_NZ_QUANT_MATMUL_N = 512
+
+
+def _needs_fp16_quant_matmul_fallback(_layer: torch.nn.Module, _weight: torch.Tensor) -> bool:
+    """310P W8A8-Dynamic linear always uses ND + fp16 dequant.
+
+    GE retile of FRACTAL_NZ weights during torch.compile launches
+    ``QuantBatchMatmulV3_NZ_NZ`` kernel 21 (hash 5247287448945562503). Eager NZ
+    works; compiled 2B TP2 does not, including fused qkv and MLP. Keep this
+    helper so tests can assert the fallback policy.
+    """
+    return True
 
 
 @register_scheme("W8A8_DYNAMIC", "moe")
@@ -193,29 +210,15 @@ class AscendW8A8DynamicLinearMethod310(AscendW8A8Linear310pScheme):
         bias: torch.Tensor | None = None,
         tp_rank: int | None = 0,
     ) -> torch.Tensor:
-        quantized_x, pertoken_scale = torch_npu.npu_dynamic_quant(x, dst_type=self.act_quant_type)
-        need_unsqz = False
-        if pertoken_scale.dim() == 2:
-            need_unsqz = True
-            quantized_x = quantized_x.squeeze(dim=1)
-            pertoken_scale = pertoken_scale.squeeze(dim=1)
-
-        # NOTE(310P):
-        # - Currently, W8A8 dynamic quantization supports only symmetric quantization.
-        output = torch_npu.npu_quant_matmul(
-            quantized_x,
-            layer.weight.data,
-            layer.weight_scale,
-            pertoken_scale=pertoken_scale,
-            bias=bias if tp_rank == 0 else None,
-            output_dtype=x.dtype,
-        )
-        if need_unsqz:
-            output = output.unsqueeze(dim=1)
-        return output
+        # Always ND [N, K] + fp16 dequant. torch.compile/GE cannot safely run
+        # 310P QuantBatchMatmulV3_NZ_NZ on these dynamic-quant linears.
+        scale = layer.weight_scale.data if hasattr(layer.weight_scale, "data") else layer.weight_scale
+        weight_fp = layer.weight.data.to(x.dtype) * scale.to(x.dtype).view(-1, 1)
+        bias_term = bias if (tp_rank is None or tp_rank == 0) else None
+        return torch.nn.functional.linear(x, weight_fp, bias_term)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # cast quantized weight tensors in NZ format for higher inference speed
-        layer.weight.data = maybe_trans_nz(layer.weight.data).transpose(0, 1)
+        layer.weight.data = layer.weight.data.contiguous()
+        layer._310p_w8a8_dynamic_fp16_fallback = _needs_fp16_quant_matmul_fallback(layer, layer.weight.data)
         layer.weight_scale.data = layer.weight_scale.data.flatten()
         layer.weight_offset.data = layer.weight_offset.data.flatten()

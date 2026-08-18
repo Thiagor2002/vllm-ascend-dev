@@ -139,11 +139,12 @@ still needs 310P acceptance.
 | Qwen3-VL-2B-Instruct | verified TP1/TP2 | verified (encoder eager, decode graph) | quantized VL checkpoint pending |
 | Qwen3-VL-8B-Instruct | verified TP1/TP2 | verified (encoder eager, decode graph) | quantized VL checkpoint pending |
 | Qwen3-30B-A3B | verified TP2 | verified | W8A8-Dynamic expert checkpoint e2e-ready; static W8A8/W8A8SC experts unsupported |
-| Qwen3.5-2B | verified TP + graph | verified | Qwen3.5-2B-W8A8 is known failing |
+| Qwen3.5-2B | verified TP + graph | verified | Qwen3.5-2B-W8A8 verified TP2 + graph (310P dynamic linear uses ND fp16 dequant) |
 | Qwen3.5-4B | FP16 code-compatible; post-§31 hardware re-validation required | FP16 hardware re-validation required | Qwen3.5-4B-W8A8 verified with TP + graph |
+| Qwen3.5-9B | — | — | Qwen3.5-9B-W8A8 verified TP2 + graph |
 | Qwen3.5-27B | verified TP4 | verified | quantized checkpoint pending |
-| Qwen3.5-35B-A3B | known failing TP4 | known failing | blocks the Qwen3.5-MoE support claim |
-| Qwen3.5-VL-2B (reported checkpoint) | known failing | known failing | investigated as a follow-up; not claimed by this first release |
+| Qwen3.5-35B-A3B | verified TP2; TP4 on this server is memory-bound | verified TP2 | Qwen3.5-MoE FP16; local `Qwen3.5-VL-35B-A3B` is JANG, not Ascend |
+| Qwen3.5-VL-2B (local checkpoint) | invalid artifact | invalid artifact | MLX affine 8-bit; not an Ascend/ModelSlim checkpoint |
 
 Quantization boundary (layer registry, shared by V1/V2):
 
@@ -161,12 +162,13 @@ and remains rejected here.
 - The verified list reflects the supplied 310P real-weight serve results; the
   repository changes alone do not upgrade an `e2e-ready` or `known failing`
   entry to verified.
-- Qwen3.5-35B-A3B must pass eager first, then TP + graph and consecutive
-  requests, before the PR claims Qwen3.5-MoE support.
-- Its eager/graph E2E cases are retained as acceptance targets, not evidence
-  that the currently failing checkpoint is supported.
-- Qwen3.5-2B-W8A8 must be diagnosed independently; the verified
-  Qwen3.5-4B-W8A8 result does not prove all Qwen3.5 dense checkpoints.
+- Qwen3.5-35B-A3B FP16 TP2 + graph is the Qwen3.5-MoE claim. Local
+  `Qwen3.5-VL-35B-A3B` is a JANG/MLX dump and must not be used as acceptance.
+- Qwen3.5-2B-W8A8 compiled NZ `npu_quant_matmul` aicore-faults on 310P
+  (`QuantBatchMatmulV3_NZ_NZ` kernel 21). 310P W8A8-Dynamic *linear* keeps
+  ND weights and dequants to fp16; MoE experts still use grouped-matmul NZ.
+- Local `Qwen3.5-VL-2B` is MLX affine 8-bit. ModelSlim no longer claims
+  `bits`+`group_size` dumps as `"ascend"`.
 - Static W8A8/W8A8SC expert descriptions are an explicit operator boundary,
   not a missing registry alias. Quantized MoE checkpoints must describe
   experts as W8A8-Dynamic.
@@ -346,8 +348,9 @@ variable unset, the existing Model Runner V1 path is unchanged.
 3. Run the 310P accuracy and throughput acceptance matrix for W8A8-Dynamic
    Dense and MoE checkpoints; keep the fixed contract unless hardware evidence
    requires a reviewed operator change.
-4. Diagnose Qwen3.5-2B-W8A8 and Qwen3.5-35B-A3B from their first fatal
-   traceback; do not generalize the verified Qwen3.5-4B-W8A8 result to them.
+4. Optional: restore 310P W8A8-Dynamic linear NZ `npu_quant_matmul` once GE
+   can compile `QuantBatchMatmulV3` for small KV shards (Qwen3.5-2B TP2 N=256)
+   without kernel 21. Current path is ND fp16 dequant for linears only.
 5. Reduce `NPUModelRunner310V2.initialize_kv_cache` duplication by hooking
    `_allocate_kv_cache_tensors` in the shared runner.
 6. If [vLLM #43048](https://github.com/vllm-project/vllm/pull/43048) merges

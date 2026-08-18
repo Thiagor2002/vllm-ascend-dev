@@ -26,6 +26,7 @@ from vllm_ascend._310p.worker.v2.model_state import (
     Ascend310PMambaHybridModelState,
     Ascend310PModelState,
 )
+from vllm_ascend._310p.worker.v2.rope import Ascend310PRopeState
 from vllm_ascend._310p.worker.v2.sampler import Ascend310PGreedySampler
 from vllm_ascend.patch.platform import patch_use_v2_model_runner
 from vllm_ascend.worker.v2.model_runner import NPUModelRunner
@@ -175,7 +176,7 @@ def test_310p_hybrid_model_state_initializes_full_upstream_contract() -> None:
     ):
         Ascend310PMambaHybridModelState.__init__(state, config, model, encoder_cache, device)
 
-    parent_init.assert_called_once_with(config, model, encoder_cache, device)
+    parent_init.assert_called_once_with(state, config, model, encoder_cache, device)
     replace_rope_state.assert_called_once_with(encoder_cache)
     assert state._capture_seq_lens_by_ptr == {}
 
@@ -183,7 +184,7 @@ def test_310p_hybrid_model_state_initializes_full_upstream_contract() -> None:
 def test_310p_mrope_state_prepares_cos_sin_before_model_forward() -> None:
     model_state = object.__new__(Ascend310PMambaHybridModelState)
     model_state.model_config = SimpleNamespace(uses_mrope=True)
-    model_state.rope_state = MagicMock()
+    model_state.rope_state = MagicMock(spec=Ascend310PRopeState)
     positions = torch.zeros((3, 4), dtype=torch.int64)
     model_state.rope_state.get_positions.return_value = positions
     input_batch = SimpleNamespace(
@@ -232,7 +233,7 @@ def test_first_release_config_rejects_prefix_caching() -> None:
     config = _make_vllm_config()
     config.cache_config.enable_prefix_caching = True
 
-    with pytest.raises(NotImplementedError, match="deferred to the second"):
+    with pytest.raises(NotImplementedError, match="deferred to a later"):
         NPUModelRunner310V2._validate_first_release_config(config)
 
 

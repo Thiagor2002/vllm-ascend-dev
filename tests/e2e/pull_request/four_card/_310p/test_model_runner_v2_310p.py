@@ -130,3 +130,19 @@ def test_model_runner_v2_qwen3_vl_tp2_aclgraph(model: str) -> None:
             "cudagraph_capture_sizes": [1, 2],
         },
     )
+
+
+@patch.dict(os.environ, {"VLLM_USE_V2_MODEL_RUNNER": "1"})
+def test_model_runner_v2_qwen3_5_vl_tp2_aclgraph() -> None:
+    run_vl_model_test(
+        model_name="Qwen/Qwen3.5-2B",
+        tensor_parallel_size=2,
+        max_tokens=5,
+        enforce_eager=False,
+        enable_prefix_caching=False,
+        compilation_config={
+            "cudagraph_mode": "FULL_DECODE_ONLY",
+            "cudagraph_capture_sizes": [1, 2],
+        },
+        **hybrid_runner_kwargs("Qwen/Qwen3.5-2B"),
+    )

@@ -95,3 +95,22 @@ def test_model_runner_v2_qwen3_vl_tp1_aclgraph(model: str) -> None:
             "cudagraph_capture_sizes": [1, 2],
         },
     )
+
+
+@patch.dict(os.environ, {"VLLM_USE_V2_MODEL_RUNNER": "1"})
+@wait_until_npu_memory_free(0.7)
+def test_model_runner_v2_qwen3_5_vl_tp1_aclgraph() -> None:
+    # Qwen3.5 dense checkpoints are natively VL. Encoder profile hits the
+    # bilinear pos-embed path that must stay Triton-free on 310P.
+    run_vl_model_test(
+        model_name="Qwen/Qwen3.5-2B",
+        tensor_parallel_size=1,
+        max_tokens=5,
+        enforce_eager=False,
+        enable_prefix_caching=False,
+        compilation_config={
+            "cudagraph_mode": "FULL_DECODE_ONLY",
+            "cudagraph_capture_sizes": [1, 2],
+        },
+        **hybrid_runner_kwargs("Qwen/Qwen3.5-2B"),
+    )
