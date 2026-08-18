@@ -134,10 +134,12 @@ still needs 310P acceptance.
 
 | Model | TP | ACL Graph `FULL_DECODE_ONLY` | Quantization boundary |
 | --- | --- | --- | --- |
-| Qwen3-8B | verified TP + graph | verified | W8A8 verified; W8A8SC TP1 e2e-ready (TP2 not covered); W8A8-Dynamic TP1/TP2 e2e-ready |
+| Qwen3-8B | verified TP + graph | verified | W8A8 verified; W8A8SC verified TP1/TP2 + graph (`sharded_state`); W8A8-Dynamic TP1/TP2 e2e-ready |
 | Qwen3-Embedding-8B | verified TP2 | verified | pooling TP2 graph regression added |
 | Qwen3-VL-2B-Instruct | verified TP1/TP2 | verified (encoder eager, decode graph) | quantized VL checkpoint pending |
-| Qwen3-VL-8B-Instruct | verified TP1/TP2 | verified (encoder eager, decode graph) | quantized VL checkpoint pending |
+| Qwen3-VL-4B-Instruct | verified TP1 | verified (encoder eager, decode graph) | W8A8SC TP1 + graph verified (`sharded_state`; no TP2 shard on disk) |
+| Qwen3-VL-8B-Instruct | verified TP1/TP2 | verified (encoder eager, decode graph) | W8A8SC TP2 + graph verified (`sharded_state`) |
+| Qwen3-32B | — | — | W8A8SC TP4 + graph verified (`sharded_state`; no TP2 shard) |
 | Qwen3-30B-A3B | verified TP2 | verified | W8A8-Dynamic expert checkpoint e2e-ready; static W8A8/W8A8SC experts unsupported |
 | Qwen3.5-2B | verified TP + graph | verified | Qwen3.5-2B-W8A8 verified TP2 + graph (310P dynamic linear uses ND fp16 dequant) |
 | Qwen3.5-4B | FP16 code-compatible; post-§31 hardware re-validation required | FP16 hardware re-validation required | Qwen3.5-4B-W8A8 verified with TP + graph |
@@ -172,6 +174,10 @@ and remains rejected here.
 - Static W8A8/W8A8SC expert descriptions are an explicit operator boundary,
   not a missing registry alias. Quantized MoE checkpoints must describe
   experts as W8A8-Dynamic.
+- W8A8SC dense/VL dumps are pre-sharded compressed ModelSlim artifacts.
+  Serve with `--quantization ascend --load-format sharded_state` and a TP
+  size that matches the shard folder (8B/VL-8B TP2, VL-4B TP1 only, 32B
+  TP4 only). MRv2 reuses `AscendW8A8SCLinearMethod310`.
 
 ## 4. Test inventory
 
@@ -205,10 +211,10 @@ so the unit commands above still need to run in the Linux development image.
 ### E2E (310P hardware)
 
 ```bash
-# one card: dense/hybrid TP1 + graph; W8A8/W8A8SC/W8A8-Dynamic; VL eager+graph
+# one card: dense/hybrid TP1 + graph; W8A8/W8A8-Dynamic; W8A8SC sharded_state; VL
 pytest -sv tests/e2e/pull_request/one_card/_310p/test_model_runner_v2_310p.py
 
-# four cards: TP2 dense/hybrid/VL/embedding; TP2 quant; TP4 Qwen3.5-27B
+# four cards: TP2 dense/hybrid/VL/embedding; TP2 W8A8/W8A8SC; TP4 27B / 32B-W8A8SC
 pytest -sv tests/e2e/pull_request/four_card/_310p/test_model_runner_v2_310p.py
 
 # four cards: Qwen3-30B-A3B TP2 eager/graph; Qwen3.5-35B-A3B TP4 eager/graph

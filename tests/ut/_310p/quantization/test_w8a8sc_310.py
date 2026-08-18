@@ -15,8 +15,6 @@
 
 import math
 from unittest.mock import MagicMock, patch
-
-import pytest
 import torch
 
 from tests.ut.base import TestBase
@@ -52,7 +50,6 @@ class TestAscendW8A8SCLinearMethod310(TestBase):
         self.assertEqual(params["quant_bias"].shape, (10,))
         self.assertEqual(params["deq_scale"].shape, (10,))
 
-    @pytest.mark.skip("Skip as npu_matmul_compress_dequant will be supported in PTA 26.0.0.")
     @patch("torch.ops.vllm.quantize")
     @patch("torch_npu.npu_matmul_compress_dequant")
     def test_apply_with_x_not_int8_310(self, mock_matmul_compress_dequant, mock_quantize):
@@ -83,7 +80,6 @@ class TestAscendW8A8SCLinearMethod310(TestBase):
         )
         self.assertTrue(torch.equal(output, expected_y_output))
 
-    @pytest.mark.skip("Skip as npu_matmul_compress_dequant will be supported in PTA 26.0.0.")
     @patch("torch.ops.vllm.quantize")
     @patch("torch_npu.npu_matmul_compress_dequant")
     def test_apply_with_x_is_int8_310(self, mock_matmul_compress_dequant, mock_quantize):

@@ -1257,3 +1257,28 @@ MRV1 对照：
 - Qwen3.5-2B-W8A8 TP2 图模式两次 curl 200，decode 走 ACL Graph `num_tokens=1`。
 - 改动后复测 Qwen3.5-9B-W8A8 TP2 图模式，两次 curl 200。
 
+## 35. Qwen3 W8A8SC MRv2 图模式验收
+
+问题现象：
+
+- 本地 W8A8SC 检查点是 ModelSlim `save_sharded_state_310.py` 预切分压缩权重，
+  必须 `--load-format sharded_state`，且 TP 必须与 shard 目录一致。
+
+修改：
+
+- 运行时仍走既有 310P 方案 `AscendW8A8SCLinearMethod310`
+  (`npu_matmul_compress_dequant`)。MRv2 无需新 kernel。
+- 将 W8A8SC e2e 从 dense W8A8/W8A8-Dynamic 参数化中拆出，显式传
+  `load_format="sharded_state"`。
+- 新增 Qwen3-8B TP2、Qwen3-32B TP4、Qwen3-VL-4B TP1、Qwen3-VL-8B TP2
+  ACL Graph e2e。
+- `tests/ut/_310p/quantization/test_w8a8sc_310.py` 取消 apply skip
+  （PTA 26 已有该算子；用例仍 mock）。
+
+验证（`FULL_DECODE_ONLY` `[1,16]`，docker `v0230_mrv2_dy`）：
+
+- Qwen3-8B-W8A8SC TP2（NPU 6,7）两次 curl 200。
+- Qwen3-VL-8B-W8A8SC TP2 文本 + 图像 curl 200。
+- Qwen3-VL-4B-W8A8SC TP1（仅有 TP1 shard）文本 + 图像 curl 200。
+- Qwen3-32B-W8A8SC TP4（仅有 TP4 shard；NPU 2,3,6,7）两次 curl 200。
+

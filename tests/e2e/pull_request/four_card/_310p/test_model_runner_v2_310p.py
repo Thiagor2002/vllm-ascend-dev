@@ -65,6 +65,28 @@ def test_model_runner_v2_tp2_quantized_aclgraph(model: str) -> None:
 
 
 @patch.dict(os.environ, {"VLLM_USE_V2_MODEL_RUNNER": "1"})
+def test_model_runner_v2_tp2_w8a8sc_aclgraph() -> None:
+    with VllmRunner(
+        "vllm-ascend/Qwen3-8B-w8a8sc-310-vllm-tp2",
+        tensor_parallel_size=2,
+        dtype="float16",
+        quantization="ascend",
+        load_format="sharded_state",
+        max_model_len=2048,
+        enable_prefix_caching=False,
+        compilation_config={
+            "cudagraph_mode": "FULL_DECODE_ONLY",
+            "cudagraph_capture_sizes": [1, 2],
+        },
+    ) as runner:
+        outputs = runner.generate_greedy(["Hello, my name is"], max_tokens=4)
+        follow_up_outputs = runner.generate_greedy(["Count to two."], max_tokens=2)
+
+    assert outputs[0][0]
+    assert follow_up_outputs[0][0]
+
+
+@patch.dict(os.environ, {"VLLM_USE_V2_MODEL_RUNNER": "1"})
 def test_model_runner_v2_qwen3_5_27b_tp4_aclgraph() -> None:
     with VllmRunner(
         "Qwen/Qwen3.5-27B",
@@ -82,6 +104,29 @@ def test_model_runner_v2_qwen3_5_27b_tp4_aclgraph() -> None:
     ) as runner:
         outputs = runner.generate_greedy(["Hello, my name is"], max_tokens=4)
         follow_up_outputs = runner.generate_greedy(["Give one short greeting."], max_tokens=2)
+
+    assert outputs[0][0]
+    assert follow_up_outputs[0][0]
+
+
+@patch.dict(os.environ, {"VLLM_USE_V2_MODEL_RUNNER": "1"})
+def test_model_runner_v2_tp4_w8a8sc_aclgraph() -> None:
+    with VllmRunner(
+        "vllm-ascend/Qwen3-32B-w8a8sc-310-vllm-tp4",
+        tensor_parallel_size=4,
+        dtype="float16",
+        quantization="ascend",
+        load_format="sharded_state",
+        max_model_len=2048,
+        max_num_seqs=4,
+        enable_prefix_caching=False,
+        compilation_config={
+            "cudagraph_mode": "FULL_DECODE_ONLY",
+            "cudagraph_capture_sizes": [1, 2],
+        },
+    ) as runner:
+        outputs = runner.generate_greedy(["Hello, my name is"], max_tokens=4)
+        follow_up_outputs = runner.generate_greedy(["Count to two."], max_tokens=2)
 
     assert outputs[0][0]
     assert follow_up_outputs[0][0]
@@ -145,4 +190,21 @@ def test_model_runner_v2_qwen3_5_vl_tp2_aclgraph() -> None:
             "cudagraph_capture_sizes": [1, 2],
         },
         **hybrid_runner_kwargs("Qwen/Qwen3.5-2B"),
+    )
+
+
+@patch.dict(os.environ, {"VLLM_USE_V2_MODEL_RUNNER": "1"})
+def test_model_runner_v2_qwen3_vl_8b_w8a8sc_tp2_aclgraph() -> None:
+    run_vl_model_test(
+        model_name="vllm-ascend/Qwen3-VL-8B-Instruct-w8a8sc-310-vllm-tp2",
+        tensor_parallel_size=2,
+        max_tokens=5,
+        enforce_eager=False,
+        enable_prefix_caching=False,
+        quantization="ascend",
+        load_format="sharded_state",
+        compilation_config={
+            "cudagraph_mode": "FULL_DECODE_ONLY",
+            "cudagraph_capture_sizes": [1, 2],
+        },
     )
