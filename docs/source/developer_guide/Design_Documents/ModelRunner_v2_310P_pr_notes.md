@@ -140,7 +140,7 @@ still needs 310P acceptance.
 | Qwen3-VL-4B-Instruct | verified TP1 | verified (encoder eager, decode graph) | W8A8SC TP1 + graph verified (`sharded_state`; no TP2 shard on disk) |
 | Qwen3-VL-8B-Instruct | verified TP1/TP2 | verified (encoder eager, decode graph) | W8A8SC TP2 + graph verified (`sharded_state`) |
 | Qwen3-32B | — | — | W8A8SC TP4 + graph verified (`sharded_state`; no TP2 shard) |
-| Qwen3-30B-A3B | verified TP2 | verified | W8A8-Dynamic expert checkpoint e2e-ready; static W8A8/W8A8SC experts unsupported |
+| Qwen3-30B-A3B | verified TP2 | verified | W8A8 hybrid (static attention + W8A8-Dynamic experts) MRv2 TP2+graph serve verified; greedy text currently degenerate on V1 and V2 |
 | Qwen3.5-2B | verified TP + graph | verified | Qwen3.5-2B-W8A8 verified TP2 + graph (310P dynamic linear uses ND fp16 dequant) |
 | Qwen3.5-4B | FP16 code-compatible; post-§31 hardware re-validation required | FP16 hardware re-validation required | Qwen3.5-4B-W8A8 verified with TP + graph |
 | Qwen3.5-9B | — | — | Qwen3.5-9B-W8A8 verified TP2 + graph |
@@ -153,7 +153,7 @@ Quantization boundary (layer registry, shared by V1/V2):
 | Layer | W8A8 | W8A8SC | W8A8-Dynamic |
 | --- | --- | --- | --- |
 | Dense linear | supported | supported | supported; fixed int8 activation contract |
-| MoE experts | unsupported on 310P grouped operator | unsupported on 310P grouped operator | supported; weights are transposed to `[E,K,N]` before NZ |
+| MoE experts | unsupported on 310P grouped operator | unsupported on 310P grouped operator | supported; ND `[E,N,K]`, FRACTAL_NZ cast inside opaque custom op |
 
 W4A8, EP, PP, DP, CP, LoRA, KV transfer, sleep mode, structured output, and
 non-greedy sampling are rejected. Expert Parallel is out of 310P V1 scope
@@ -168,7 +168,9 @@ and remains rejected here.
   `Qwen3.5-VL-35B-A3B` is a JANG/MLX dump and must not be used as acceptance.
 - Qwen3.5-2B-W8A8 compiled NZ `npu_quant_matmul` aicore-faults on 310P
   (`QuantBatchMatmulV3_NZ_NZ` kernel 21). 310P W8A8-Dynamic *linear* keeps
-  ND weights and dequants to fp16; MoE experts still use grouped-matmul NZ.
+  ND weights and dequants to fp16; MoE experts keep ND `[E, N, K]` and cast
+  to FRACTAL_NZ inside `npu_quant_grouped_matmul_dequant_310` (GE strips
+  format-29 from 3D Parameters).
 - Local `Qwen3.5-VL-2B` is MLX affine 8-bit. ModelSlim no longer claims
   `bits`+`group_size` dumps as `"ascend"`.
 - Static W8A8/W8A8SC expert descriptions are an explicit operator boundary,

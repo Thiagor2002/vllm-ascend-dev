@@ -63,8 +63,8 @@ def test_model_runner_v2_qwen3_moe_tp2_aclgraph():
 
 @patch.dict(os.environ, {"VLLM_USE_V2_MODEL_RUNNER": "1"})
 def test_model_runner_v2_qwen3_moe_w8a8_dynamic_tp2_aclgraph():
-    # This checkpoint's expert quantization description must be
-    # W8A8_DYNAMIC. Static W8A8/W8A8SC expert descriptions are rejected.
+    # Hybrid checkpoint: static W8A8 attention + W8A8_DYNAMIC experts.
+    # 310P WeightNZ is applied inside npu_quant_grouped_matmul_dequant_310.
     with VllmRunner(
         "vllm-ascend/Qwen3-30B-A3B-W8A8",
         tensor_parallel_size=2,

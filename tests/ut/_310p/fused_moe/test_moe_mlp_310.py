@@ -19,7 +19,11 @@ import torch
 
 from tests.ut.base import TestBase
 from vllm_ascend._310p.fused_moe.moe_comm_method import AllGatherCommImpl310
-from vllm_ascend._310p.fused_moe.moe_mlp import unified_apply_mlp
+from vllm_ascend._310p.fused_moe.moe_mlp import (
+    _quant_grouped_matmul_dequant_310_impl,
+    unified_apply_mlp,
+)
+from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
 from vllm_ascend.ops.fused_moe.moe_runtime_args import (
     MoEMlpComputeInput,
     MoEQuantParams,
@@ -118,25 +122,23 @@ class TestUnifiedApplyMLP310(TestBase):
         self.assertEqual(result.dtype, torch.float16)
 
     @patch("torch.cumsum")
-    @patch("torch_npu.npu_quant_grouped_matmul_dequant", create=True)
+    @patch("vllm_ascend._310p.fused_moe.moe_mlp.quant_gmm_310")
     @patch("torch_npu.npu_swiglu")
-    def test_unified_apply_mlp_with_quantization_310(
-        self, mock_npu_swiglu, mock_npu_quant_grouped_matmul_dequant, mock_cumsum
-    ):
+    def test_unified_apply_mlp_with_quantization_310(self, mock_npu_swiglu, mock_quant_gmm_310, mock_cumsum):
         mock_cumsum_out = torch.arange(0, 10, dtype=torch.int64)
         mock_cumsum.return_value = mock_cumsum_out
         mock_gmm1_out = torch.randn(10, 40, dtype=torch.float16)
         mock_gmm2_out = torch.randn(10, 20, dtype=torch.float16)
-        mock_npu_quant_grouped_matmul_dequant.side_effect = [mock_gmm1_out, mock_gmm2_out]
+        mock_quant_gmm_310.side_effect = [mock_gmm1_out, mock_gmm2_out]
 
         mock_npu_swiglu_output = torch.randn(10, 40, dtype=torch.float16)
         mock_npu_swiglu.return_value = mock_npu_swiglu_output
 
         hidden_states = torch.randn(10, 20, dtype=torch.float16)
-        w1 = torch.randn(5, 20, 40, dtype=torch.float16)
+        w1 = torch.randn(5, 40, 20, dtype=torch.float16)
         w1_scale = torch.rand(5, 40, dtype=torch.float32)
-        w2 = torch.randn(5, 40, 20, dtype=torch.float16)
-        w2_scale = torch.rand(5, 40, dtype=torch.float32)
+        w2 = torch.randn(5, 20, 40, dtype=torch.float16)
+        w2_scale = torch.rand(5, 20, dtype=torch.float32)
         group_list = torch.tensor([2, 4, 6, 8, 10], dtype=torch.int64)
 
         result = unified_apply_mlp(
@@ -152,28 +154,39 @@ class TestUnifiedApplyMLP310(TestBase):
         )
 
         mock_cumsum.assert_called_once()
-        self.assertEqual(mock_npu_quant_grouped_matmul_dequant.call_count, 2)
-        mock_npu_quant_grouped_matmul_dequant.assert_has_calls(
+        self.assertEqual(mock_quant_gmm_310.call_count, 2)
+        mock_quant_gmm_310.assert_has_calls(
             [
-                call(
-                    x=hidden_states,
-                    quantized_weight=w1,
-                    weight_scale=w1_scale,
-                    group_list=mock_cumsum_out,
-                    quant_mode="pertoken",
-                ),
-                call(
-                    x=mock_npu_swiglu_output,
-                    quantized_weight=w2,
-                    weight_scale=w2_scale,
-                    group_list=mock_cumsum_out,
-                    quant_mode="pertoken",
-                ),
-            ],
-            any_order=True,
+                call(hidden_states, w1, w1_scale, mock_cumsum_out),
+                call(mock_npu_swiglu_output, w2, w2_scale, mock_cumsum_out),
+            ]
         )
         mock_npu_swiglu.assert_called_once()
         mock_npu_swiglu.assert_called_with(mock_gmm1_out)
 
         self.assertEqual(result.shape, hidden_states.shape)
         self.assertEqual(result.dtype, torch.float16)
+
+    @patch("torch_npu.npu_quant_grouped_matmul_dequant", create=True)
+    @patch("torch_npu.npu_format_cast")
+    def test_quant_gmm_impl_casts_enk_to_nz_310(self, mock_npu_format_cast, mock_npu_quant_gmm):
+        mock_npu_format_cast.side_effect = lambda x, fmt: x
+        mock_out = torch.randn(4, 32, dtype=torch.float16)
+        mock_npu_quant_gmm.return_value = mock_out
+
+        x = torch.randn(4, 64, dtype=torch.float16)
+        weight = torch.randint(-8, 8, (2, 32, 64), dtype=torch.int8)
+        scale = torch.ones(2, 32, dtype=torch.float32)
+        group_list = torch.tensor([2, 4], dtype=torch.int64)
+
+        result = _quant_grouped_matmul_dequant_310_impl(x, weight, scale, group_list)
+
+        self.assertIs(result, mock_out)
+        mock_npu_format_cast.assert_called_once()
+        nz_weight, fmt = mock_npu_format_cast.call_args[0]
+        self.assertEqual(fmt, ACL_FORMAT_FRACTAL_NZ)
+        self.assertEqual(tuple(nz_weight.shape), (2, 32, 64))
+        mock_npu_quant_gmm.assert_called_once()
+        kwargs = mock_npu_quant_gmm.call_args.kwargs
+        self.assertEqual(kwargs["quant_mode"], "pertoken")
+        self.assertEqual(tuple(kwargs["quantized_weight"].shape), (2, 32, 64))

@@ -1282,3 +1282,33 @@ MRV1 对照：
 - Qwen3-VL-4B-W8A8SC TP1（仅有 TP1 shard）文本 + 图像 curl 200。
 - Qwen3-32B-W8A8SC TP4（仅有 TP4 shard；NPU 2,3,6,7）两次 curl 200。
 
+## 36. Qwen3-30B-A3B-W8A8 MRv2 grouped-matmul NZ
+
+问题现象：
+
+- `Qwen3-30B-A3B-w8a8`（attention 静态 W8A8 + experts W8A8_DYNAMIC）MRv2 TP2
+  图模式在 `profile_run` 触发
+  `aclnnQuantGroupedMatmulDequantWeightNZ` tiling 失败：
+  `quantized_weight shape not (G, K//32, N//16, 16, 32)`。
+
+根因：
+
+- 310P WeightNZ 接受 3D FRACTAL_NZ 的 ModelSlim 布局 `[E, N, K]`。
+- `torch.compile`/GE 会剥掉 3D Parameter 的 format-29，随后走 WeightNZ 并用
+  逻辑 3D shape 做 tiling。
+- 把专家权重转成 `[E, K, N]` 再 NZ 在该算子上无法 tiling。
+
+修改：
+
+- 专家权重保持 ND `[E, N, K]`。
+- `_310p/fused_moe/moe_mlp.py` 注册不透明自定义算子
+  `npu_quant_grouped_matmul_dequant_310`，在 op 内 `npu_format_cast` 后再调
+  `npu_quant_grouped_matmul_dequant`。
+
+验证：
+
+- MRv2 TP2 `FULL_DECODE_ONLY` `[1,16]`（NPU 6,7）启动成功，两次请求 200，
+  decode ACL Graph `num_tokens=1`。
+- 隔离 GMM 与 fp16 dequant 参考接近；当前 greedy 文本在 V1 eager 与 MRv2
+  上同样不可读，不作为本轮图模式拉起的阻塞项。
+

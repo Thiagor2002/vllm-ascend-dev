@@ -175,7 +175,7 @@ class TestAscendW8A8DynamicLinearMethod310(TestBase):
 
     @patch("vllm_ascend.utils.is_310p", return_value=True)
     @patch("torch_npu.npu_format_cast")
-    def test_moe_process_weights_transposes_output_dimension_before_nz(self, mock_npu_format_cast, _mock_is_310p):
+    def test_moe_process_weights_keeps_nd_enk_layout_310p(self, mock_npu_format_cast, _mock_is_310p):
         mock_npu_format_cast.side_effect = lambda x, fmt: x
         method = AscendW8A8DynamicFusedMoEMethod310.__new__(AscendW8A8DynamicFusedMoEMethod310)
         layer = MagicMock()
@@ -208,12 +208,12 @@ class TestAscendW8A8DynamicLinearMethod310(TestBase):
 
         self.assertEqual(
             layer.w13_weight.data.shape,
-            (num_experts, hidden_size, 2 * intermediate_size),
+            (num_experts, 2 * intermediate_size, hidden_size),
         )
         self.assertEqual(
             layer.w2_weight.data.shape,
-            (num_experts, intermediate_size, hidden_size),
+            (num_experts, hidden_size, intermediate_size),
         )
         self.assertEqual(layer.w13_weight_scale.data.shape, (num_experts, 2 * intermediate_size))
         self.assertEqual(layer.w2_weight_scale.data.shape, (num_experts, hidden_size))
-        self.assertEqual(mock_npu_format_cast.call_count, 2)
+        mock_npu_format_cast.assert_not_called()
