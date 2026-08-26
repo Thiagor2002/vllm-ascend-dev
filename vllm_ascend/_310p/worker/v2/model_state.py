@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 
-"""MRV2 model state for Ascend 310P."""
+"""MRV2 model state for Ascend 310P (dense/VL + hybrid/GDN)."""
 
 from typing import Any
 
@@ -17,31 +17,13 @@ from vllm_ascend._310p.ops.rotary_embedding import prepare_mrope_cos_sin_slices_
 from vllm_ascend._310p.worker.v2.rope import Ascend310PRopeState, get_310p_rope_state
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch
 from vllm_ascend.worker.v2.model_states.default import AscendModelState
+from vllm_ascend.worker.v2.model_states.mamba_hybrid import AscendMambaHybridModelState
 
 from .sampler import Ascend310PSampler
 
 
-class Ascend310PModelState(AscendModelState):
-    """Model state with Triton-free 310P sampler / MRoPE and encoder support."""
-
-    # TODO: Refactor the sampler override to use Triton Dispatcher after vLLM
-    # RFC #45133 lands.
-
-    def __init__(
-        self,
-        vllm_config: VllmConfig,
-        model: nn.Module,
-        encoder_cache: EncoderCache | None,
-        device: torch.device,
-    ) -> None:
-        # Initialize the full Ascend/DefaultModelState contract first so
-        # attributes such as ``prompt_embeds_state`` / ``encoder_runner`` exist,
-        # then swap RoPE to the Triton-free 310P implementation.
-        AscendModelState.__init__(self, vllm_config, model, encoder_cache, device)
-        # ACLGraph replays the tensor addresses bound during capture. Keep every
-        # captured seq_lens buffer so its contents can be refreshed before replay.
-        self._capture_seq_lens_by_ptr: dict[int, torch.Tensor] = {}
-        self._replace_310p_rope_state(encoder_cache)
+class _Ascend310PModelStateMixin:
+    """310P RoPE / FULL-graph seq_lens helpers shared by dense and hybrid."""
 
     def _replace_310p_rope_state(self, encoder_cache: EncoderCache | None) -> None:
         self.rope_state = get_310p_rope_state(
@@ -123,3 +105,63 @@ class Ascend310PModelState(AscendModelState):
     def custom_sampler(self, sampler):
         del sampler
         return Ascend310PSampler(), None
+
+
+class Ascend310PModelState(_Ascend310PModelStateMixin, AscendModelState):
+    """Model state with Triton-free 310P sampler / MRoPE and encoder support."""
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        model: nn.Module,
+        encoder_cache: EncoderCache | None,
+        device: torch.device,
+    ) -> None:
+        # Initialize the full Ascend/DefaultModelState contract first so
+        # attributes such as ``prompt_embeds_state`` / ``encoder_runner`` exist,
+        # then swap RoPE to the Triton-free 310P implementation.
+        AscendModelState.__init__(self, vllm_config, model, encoder_cache, device)
+        # ACLGraph replays the tensor addresses bound during capture. Keep every
+        # captured seq_lens buffer so its contents can be refreshed before replay.
+        self._capture_seq_lens_by_ptr: dict[int, torch.Tensor] = {}
+        self._replace_310p_rope_state(encoder_cache)
+
+
+class Ascend310PMambaHybridModelState(_Ascend310PModelStateMixin, AscendMambaHybridModelState):
+    """310P hybrid/GDN state: keep Ascend hybrid contract, swap Triton RoPE."""
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        model: nn.Module,
+        encoder_cache: EncoderCache | None,
+        device: torch.device,
+    ) -> None:
+        # Initialize the complete upstream/Ascend hybrid contract first (e.g.
+        # ``_align_mode`` / mamba metadata), then replace Triton RoPE.
+        AscendMambaHybridModelState.__init__(self, vllm_config, model, encoder_cache, device)
+        self._capture_seq_lens_by_ptr: dict[int, torch.Tensor] = {}
+        self._replace_310p_rope_state(encoder_cache)
+
+    def postprocess_state(
+        self,
+        idx_mapping: torch.Tensor,
+        num_sampled: torch.Tensor | int,
+        num_computed_tokens: torch.Tensor | None = None,
+    ) -> None:
+        # Upstream uses Triton scatter kernels. On 310P the decorated kernel is
+        # unusable; keep the op Triton-free via NPU indexing. Filter padding
+        # ``-1`` indices: ``index_fill_`` treats ``-1`` as the last slot.
+        del num_computed_tokens
+
+        valid = idx_mapping >= 0
+        valid_indices = idx_mapping.masked_select(valid).to(dtype=torch.long)
+        if valid_indices.numel() == 0:
+            return
+
+        if isinstance(num_sampled, int):
+            self.num_accepted_tokens_gpu.index_fill_(0, valid_indices, max(num_sampled, 1))
+            return
+
+        accepted = torch.clamp(num_sampled.masked_select(valid), min=1).to(self.num_accepted_tokens_gpu.dtype)
+        self.num_accepted_tokens_gpu.index_copy_(0, valid_indices, accepted)

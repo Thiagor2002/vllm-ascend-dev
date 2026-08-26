@@ -13,10 +13,14 @@ from vllm.sampling_params import SamplingParams
 import vllm_ascend._310p.worker.v2.model_runner as model_runner_module
 from vllm_ascend._310p.worker.v2.block_table import Ascend310PBlockTables
 from vllm_ascend._310p.worker.v2.model_runner import NPUModelRunner310V2
-from vllm_ascend._310p.worker.v2.model_state import Ascend310PModelState
+from vllm_ascend._310p.worker.v2.model_state import (
+    Ascend310PMambaHybridModelState,
+    Ascend310PModelState,
+)
 from vllm_ascend._310p.worker.v2.sampler import Ascend310PSampler
 from vllm_ascend.worker.v2.model_runner import NPUModelRunner
 from vllm_ascend.worker.v2.model_states.default import AscendModelState
+from vllm_ascend.worker.v2.model_states.mamba_hybrid import AscendMambaHybridModelState
 
 
 def _make_vllm_config(**overrides):
@@ -49,18 +53,53 @@ def test_config_accepts_tensor_parallelism() -> None:
 
 
 def test_config_accepts_qwen3_vl_multimodal_mrope() -> None:
-    """Qwen3-VL is multimodal + MRoPE; first-release 310P MRv2 must allow it."""
+    """Qwen3-VL is multimodal + MRoPE; 310P MRv2 must allow it."""
     config = _make_vllm_config()
     config.model_config.is_multimodal_model = True
     config.model_config.uses_mrope = True
     NPUModelRunner310V2._validate_config(config)
 
 
-def test_config_rejects_hybrid_models() -> None:
+def test_config_accepts_qwen35_hybrid() -> None:
+    """Qwen3.5 is hybrid + multimodal + MRoPE; 310P MRv2 must allow it."""
     config = _make_vllm_config()
     config.model_config.is_hybrid = True
-    with pytest.raises(NotImplementedError, match="Hybrid models"):
-        NPUModelRunner310V2._validate_config(config)
+    config.model_config.is_multimodal_model = True
+    config.model_config.uses_mrope = True
+    NPUModelRunner310V2._validate_config(config)
+
+
+def test_310p_hybrid_model_state_keeps_ascend_hybrid_behavior() -> None:
+    assert issubclass(Ascend310PMambaHybridModelState, AscendMambaHybridModelState)
+
+
+def test_310p_hybrid_postprocess_filters_padding_indices() -> None:
+    state = object.__new__(Ascend310PMambaHybridModelState)
+    state.num_accepted_tokens_gpu = torch.zeros(4, dtype=torch.int32)
+    idx_mapping = torch.tensor([0, -1, 2], dtype=torch.int32)
+
+    state.postprocess_state(idx_mapping, num_sampled=3)
+    torch.testing.assert_close(state.num_accepted_tokens_gpu, torch.tensor([3, 0, 3, 0], dtype=torch.int32))
+
+    num_sampled = torch.tensor([2, 9, 4], dtype=torch.int32)
+    state.postprocess_state(idx_mapping, num_sampled=num_sampled)
+    torch.testing.assert_close(state.num_accepted_tokens_gpu, torch.tensor([2, 0, 4, 0], dtype=torch.int32))
+
+
+def test_310p_hybrid_model_state_initializes_full_upstream_contract() -> None:
+    state = object.__new__(Ascend310PMambaHybridModelState)
+    config = object()
+    model = object()
+    encoder_cache = object()
+    device = torch.device("cpu")
+    with (
+        patch.object(AscendMambaHybridModelState, "__init__") as parent_init,
+        patch.object(Ascend310PMambaHybridModelState, "_replace_310p_rope_state") as replace_rope,
+    ):
+        Ascend310PMambaHybridModelState.__init__(state, config, model, encoder_cache, device)
+    parent_init.assert_called_once_with(state, config, model, encoder_cache, device)
+    replace_rope.assert_called_once_with(encoder_cache)
+    assert isinstance(state._capture_seq_lens_by_ptr, dict)
 
 
 @pytest.mark.parametrize(("finished_req_ids", "sync_count"), [({"finished"}, 1), (set(), 0)])
