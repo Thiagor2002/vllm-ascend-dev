@@ -301,7 +301,7 @@ def test_config_rejects_non_mtp_speculative_config() -> None:
 
 
 def test_sampler_rejects_random_sampling_parameters() -> None:
-    sampler = Ascend310PSampler()
+    sampler = Ascend310PSampler(max_num_reqs=4, device=torch.device("cpu"))
     sampler.add_request(0, 4, SamplingParams(temperature=0))
     with pytest.raises(NotImplementedError, match="Unsupported sampling parameters"):
         sampler.add_request(1, 4, SamplingParams(temperature=1))
