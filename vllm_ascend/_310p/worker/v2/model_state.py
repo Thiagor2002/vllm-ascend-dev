@@ -20,6 +20,7 @@ from vllm_ascend.worker.v2.input_batch import AscendInputBatch
 from vllm_ascend.worker.v2.model_states.default import AscendModelState
 from vllm_ascend.worker.v2.model_states.mamba_hybrid import AscendMambaHybridModelState
 
+from .rejection_sampler import RejectionSampler310V2
 from .sampler import Ascend310PSampler
 
 
@@ -119,7 +120,14 @@ class _Ascend310PModelStateMixin:
 
     def custom_sampler(self, sampler):
         del sampler
-        return Ascend310PSampler(), None
+        base_sampler = Ascend310PSampler(self.max_num_reqs, self.device)
+        vllm_config = getattr(self, "vllm_config", None)
+        spec_config = None if vllm_config is None else vllm_config.speculative_config
+        if spec_config is None:
+            return base_sampler, None
+        if spec_config.method != "mtp":
+            raise NotImplementedError(f"310P MRv2 only supports MTP speculative decoding, got {spec_config.method!r}.")
+        return base_sampler, RejectionSampler310V2(base_sampler, spec_config, self.device)
 
 
 class Ascend310PModelState(_Ascend310PModelStateMixin, AscendModelState):

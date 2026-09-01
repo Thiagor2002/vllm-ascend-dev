@@ -280,7 +280,6 @@ def test_config_rejects_non_tp_parallelism(setting: str) -> None:
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
-        ("speculative_config", object(), "Speculative decoding"),
         ("kv_transfer_config", object(), "KV cache transfer"),
         ("lora_config", object(), "LoRA"),
     ],
@@ -288,6 +287,17 @@ def test_config_rejects_non_tp_parallelism(setting: str) -> None:
 def test_config_rejects_out_of_scope_features(field, value, message) -> None:
     with pytest.raises(NotImplementedError, match=message):
         NPUModelRunner310V2._validate_config(_make_vllm_config(**{field: value}))
+
+
+def test_config_accepts_mtp_speculative_config() -> None:
+    spec = SimpleNamespace(method="mtp", num_speculative_tokens=1)
+    NPUModelRunner310V2._validate_config(_make_vllm_config(speculative_config=spec))
+
+
+def test_config_rejects_non_mtp_speculative_config() -> None:
+    spec = SimpleNamespace(method="eagle", num_speculative_tokens=1)
+    with pytest.raises(NotImplementedError, match="only supports MTP"):
+        NPUModelRunner310V2._validate_config(_make_vllm_config(speculative_config=spec))
 
 
 def test_sampler_rejects_random_sampling_parameters() -> None:
@@ -389,6 +399,8 @@ def test_kv_cache_allocation_uses_separate_nz_k_and_v() -> None:
 def test_model_state_uses_greedy_sampler() -> None:
     model_state = object.__new__(Ascend310PModelState)
     model_state.rope_state = None
+    model_state.max_num_reqs = 8
+    model_state.device = torch.device("cpu")
 
     model_inputs = model_state.prepare_inputs(SimpleNamespace(), req_states=None)
     sampler, speculator = model_state.custom_sampler(object())
