@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from copy import deepcopy
 from typing import Any
 
@@ -15,6 +16,7 @@ from vllm.model_executor.layers.mamba.ops.ssu_dispatch import initialize_mamba_s
 from vllm.utils.math_utils import cdiv
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.utils.torch_utils import get_dtype_size
+from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -33,7 +35,7 @@ from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.kv_connector import get_kv_connector
 from vllm.v1.worker.gpu.model_runner import sort_batch_req_ids
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
-from vllm.v1.worker.utils import bind_kv_cache
+from vllm.v1.worker.utils import bind_kv_cache, copy_kv_cache_blocks_inplace
 
 from vllm_ascend._310p.attention.attention_v1 import AscendAttentionBackend310
 from vllm_ascend._310p.worker.v2.block_table import Ascend310PBlockTables
@@ -593,6 +595,79 @@ class NPUModelRunner310V2(NPUModelRunner):
             # does not need this because it does not use that CPU gather path.
             torch.npu.current_stream().synchronize()
 
+    @staticmethod
+    def _dedupe_kv_cache_block_copies(
+        kv_cache_block_copies: Sequence[KVCacheBlockCopy],
+    ) -> list[KVCacheBlockCopy]:
+        """Drop duplicate CoW pairs from hybrid multi-manager prefix-cache hits.
+
+        Qwen3.5 hybrid models register the same physical block copy once per
+        KV-cache group (attention + mamba align). Upstream assumes a unified
+        backing allocation, so repeating the pair is harmless there. 310P
+        attention NZ caches are separate storages; applying the merged list
+        twice overflows the block view during ``copy_kv_cache_blocks_inplace``.
+        """
+        seen: set[tuple[int, int]] = set()
+        deduped: list[KVCacheBlockCopy] = []
+        for copy in kv_cache_block_copies:
+            key = (copy.src_block_id, copy.dst_block_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(copy)
+        return deduped
+
+    def _copy_kv_cache_blocks_310p(self, kv_cache_block_copies: Sequence[KVCacheBlockCopy]) -> None:
+        """Copy-on-write for hybrid prefix cache on 310P.
+
+        Upstream ``copy_kv_cache_blocks_inplace`` assumes every KV storage aliases
+        one block-major ``[num_blocks, page_size]`` byte view. 310P attention
+        caches are separate FRACTAL_NZ K/V tensors whose kernel-block layout does
+        not match ``page_size_bytes``; applying the generic copy on them triggers
+        ``setStorage`` OOM during gsm8k prefix-cache hits. Mamba state still uses
+        the block-major backing buffer and keeps the upstream copy path.
+        """
+        if not kv_cache_block_copies:
+            return
+
+        indices_np = np.array(
+            [[copy.src_block_id, copy.dst_block_id] for copy in kv_cache_block_copies],
+            dtype=np.int64,
+        )
+        seen_attn_storage: set[int] = set()
+        for k_cache, v_cache, blocks_per_kv_block in self._attn_kv_copy_params:
+            storage_ptr = k_cache.untyped_storage().data_ptr()
+            if storage_ptr in seen_attn_storage:
+                continue
+            seen_attn_storage.add(storage_ptr)
+            for src_block_id, dst_block_id in indices_np:
+                src_start = int(src_block_id) * blocks_per_kv_block
+                src_end = src_start + blocks_per_kv_block
+                dst_start = int(dst_block_id) * blocks_per_kv_block
+                dst_end = dst_start + blocks_per_kv_block
+                k_cache[dst_start:dst_end].copy_(k_cache[src_start:src_end])
+                v_cache[dst_start:dst_end].copy_(v_cache[src_start:src_end])
+
+        mamba_entries = [entry for entry in self.kv_caches if isinstance(entry, list)]
+        if mamba_entries:
+            copy_kv_cache_blocks_inplace(
+                mamba_entries,
+                self.kv_cache_config.num_blocks,
+                kv_cache_block_copies,
+            )
+
+    def update_requests(self, scheduler_output: SchedulerOutput) -> None:
+        copies = scheduler_output.kv_cache_block_copies
+        pending_copies: list[KVCacheBlockCopy] | None = None
+        if copies:
+            pending_copies = self._dedupe_kv_cache_block_copies(copies)
+        # Run block-table / zeroing updates without the upstream copy, which
+        # mishandles 310P NZ attention storages.
+        scheduler_output.kv_cache_block_copies = None
+        super().update_requests(scheduler_output)
+        if pending_copies:
+            self._copy_kv_cache_blocks_310p(pending_copies)
+
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """Restore linear-attention specs omitted by some upstream V2 versions."""
         kv_cache_spec = super().get_kv_cache_spec()
@@ -676,6 +751,8 @@ class NPUModelRunner310V2(NPUModelRunner):
             self.speculator.init_cudagraph_manager(cudagraph_mode)
 
         shared_layers = get_shared_kv_cache_layers(self.vllm_config)
+        self._attn_kv_copy_params: list[tuple[torch.Tensor, torch.Tensor, int]] = []
+        self._attn_kv_storage_ptrs: set[int] = set()
         kv_caches_dict = self._allocate_kv_cache_tensors(kv_cache_config, shared_layers)
         self.kv_caches: list[Any] = []
         bind_kv_cache(
@@ -775,8 +852,8 @@ class NPUModelRunner310V2(NPUModelRunner):
                 kv_cache_spec = layer_specs[layer_name]
                 if kv_cache_tensor.size % kv_cache_spec.page_size_bytes != 0:
                     raise ValueError("KV cache allocation is not page aligned.")
-                num_blocks = kv_cache_tensor.size // kv_cache_spec.page_size_bytes
-                if num_blocks < kv_cache_config.num_blocks:
+                num_blocks = kv_cache_config.num_blocks
+                if kv_cache_tensor.size // kv_cache_spec.page_size_bytes < num_blocks:
                     raise ValueError("KV cache allocation contains fewer blocks than requested.")
 
                 if isinstance(kv_cache_spec, AttentionSpec):
@@ -809,6 +886,10 @@ class NPUModelRunner310V2(NPUModelRunner):
                         acl_format=ACL_FORMAT_FRACTAL_NZ,
                     )
                     cache: Any = (k_cache, v_cache)
+                    storage_ptr = k_cache.untyped_storage().data_ptr()
+                    if storage_ptr not in self._attn_kv_storage_ptrs:
+                        self._attn_kv_storage_ptrs.add(storage_ptr)
+                        self._attn_kv_copy_params.append((k_cache, v_cache, blocks_per_kv_block))
                 elif isinstance(kv_cache_spec, MambaSpec):
                     # Hybrid recurrent state stays ND (int8 raw + as_strided views).
                     raw_tensor = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=self.device)

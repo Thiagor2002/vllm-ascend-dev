@@ -481,3 +481,61 @@ def test_worker_selects_v2_runner_on_310p() -> None:
     with patch("vllm_ascend._310p.worker.v2.model_runner.NPUModelRunner310V2") as runner_cls:
         worker.model_runner = worker._create_model_runner()
     runner_cls.assert_called_once_with(worker.vllm_config, worker.device)
+
+
+def test_dedupe_kv_cache_block_copies_drops_hybrid_duplicates() -> None:
+    from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
+
+    copies = [
+        KVCacheBlockCopy(src_block_id=1, dst_block_id=10),
+        KVCacheBlockCopy(src_block_id=2, dst_block_id=11),
+        KVCacheBlockCopy(src_block_id=1, dst_block_id=10),
+        KVCacheBlockCopy(src_block_id=3, dst_block_id=12),
+        KVCacheBlockCopy(src_block_id=2, dst_block_id=11),
+    ]
+    deduped = NPUModelRunner310V2._dedupe_kv_cache_block_copies(copies)
+    assert deduped == [
+        KVCacheBlockCopy(src_block_id=1, dst_block_id=10),
+        KVCacheBlockCopy(src_block_id=2, dst_block_id=11),
+        KVCacheBlockCopy(src_block_id=3, dst_block_id=12),
+    ]
+
+
+def test_copy_kv_cache_blocks_310p_copies_nz_attention_slices() -> None:
+    from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
+
+    runner = object.__new__(NPUModelRunner310V2)
+    blocks_per_kv_block = 2
+    k_cache = torch.arange(24, dtype=torch.float32).view(6, 4)
+    v_cache = torch.arange(100, 124, dtype=torch.float32).view(6, 4)
+    runner._attn_kv_copy_params = [(k_cache, v_cache, blocks_per_kv_block)]
+    runner.kv_caches = []
+    runner.kv_cache_config = SimpleNamespace(num_blocks=3)
+
+    copies = [KVCacheBlockCopy(src_block_id=1, dst_block_id=2)]
+    with patch(
+        "vllm_ascend._310p.worker.v2.model_runner.copy_kv_cache_blocks_inplace",
+    ) as generic_copy:
+        runner._copy_kv_cache_blocks_310p(copies)
+
+    assert torch.equal(k_cache[4:6], k_cache[2:4])
+    assert torch.equal(v_cache[4:6], v_cache[2:4])
+    generic_copy.assert_not_called()
+
+
+def test_copy_kv_cache_blocks_310p_delegates_mamba_to_generic_copy() -> None:
+    from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
+
+    runner = object.__new__(NPUModelRunner310V2)
+    runner._attn_kv_copy_params = []
+    mamba_state = [torch.zeros(4, 2)]
+    runner.kv_caches = [mamba_state]
+    runner.kv_cache_config = SimpleNamespace(num_blocks=2)
+    copies = [KVCacheBlockCopy(src_block_id=0, dst_block_id=1)]
+
+    with patch(
+        "vllm_ascend._310p.worker.v2.model_runner.copy_kv_cache_blocks_inplace",
+    ) as generic_copy:
+        runner._copy_kv_cache_blocks_310p(copies)
+
+    generic_copy.assert_called_once_with([mamba_state], 2, copies)
