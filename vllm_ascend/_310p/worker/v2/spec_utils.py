@@ -137,10 +137,14 @@ def greedy_rejection_sample_cpu(
         if num_logits <= 0:
             continue
         accepted = 0
+        # draft_sampled = input_ids[logits_indices] = [last_sampled, draft_0, ...]
+        # logits[i] predicts token i+1, which is draft_sampled[i+1] (upstream
+        # rejection_sampler_utils loads draft_sampled_ptr + logit_idx + 1).
         for logit_idx in range(start, end):
             target_token = int(logits_cpu[logit_idx].argmax().item())
-            draft_token = int(draft_cpu[logit_idx].item())
-            if accepted < num_speculative_steps and logit_idx < end - 1:
+            is_bonus = logit_idx >= end - 1
+            if accepted < num_speculative_steps and not is_bonus:
+                draft_token = int(draft_cpu[logit_idx + 1].item())
                 if draft_token == target_token:
                     sampled[req_idx, accepted] = target_token
                     accepted += 1

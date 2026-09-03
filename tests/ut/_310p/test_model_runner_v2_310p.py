@@ -539,3 +539,34 @@ def test_copy_kv_cache_blocks_310p_delegates_mamba_to_generic_copy() -> None:
         runner._copy_kv_cache_blocks_310p(copies)
 
     generic_copy.assert_called_once_with([mamba_state], 2, copies)
+
+
+def test_greedy_rejection_sample_accepts_draft_at_shifted_index() -> None:
+    """draft_sampled[i] is the current token; draft to verify is draft_sampled[i+1]."""
+    from vllm_ascend._310p.worker.v2.spec_utils import greedy_rejection_sample_cpu
+
+    # logits[0] predicts draft token 5; logits[1] is the bonus token 7.
+    logits = torch.zeros(2, 8)
+    logits[0, 5] = 10.0
+    logits[1, 7] = 10.0
+    draft_sampled = torch.tensor([3, 5], dtype=torch.int32)  # [last_sampled, draft]
+    cu_num_logits = torch.tensor([0, 2], dtype=torch.int32)
+
+    sampled, num_sampled = greedy_rejection_sample_cpu(logits, draft_sampled, cu_num_logits, 1)
+    assert int(num_sampled[0].item()) == 2
+    assert sampled[0, :2].tolist() == [5, 7]
+
+
+def test_greedy_rejection_sample_rejects_when_target_argmax_mismatches_draft() -> None:
+    from vllm_ascend._310p.worker.v2.spec_utils import greedy_rejection_sample_cpu
+
+    logits = torch.zeros(2, 8)
+    logits[0, 4] = 10.0
+    logits[1, 7] = 10.0
+    draft_sampled = torch.tensor([3, 5], dtype=torch.int32)
+    cu_num_logits = torch.tensor([0, 2], dtype=torch.int32)
+
+    sampled, num_sampled = greedy_rejection_sample_cpu(logits, draft_sampled, cu_num_logits, 1)
+    assert int(num_sampled[0].item()) == 1
+    assert int(sampled[0, 0].item()) == 4
+    assert int(sampled[0, 1].item()) == -1
