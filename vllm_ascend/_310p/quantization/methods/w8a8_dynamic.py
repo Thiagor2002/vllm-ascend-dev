@@ -189,9 +189,10 @@ class AscendW8A8DynamicLinearMethod310(AscendW8A8Linear310pScheme):
 
     Notes:
       - This scheme is discovered via 310P local registry.
-      - Uses true per-token dynamic act quant (``npu_dynamic_quant``) +
-        ``npu_quant_matmul``. Known accuracy issues on some shapes/Graph paths
-        are deferred; do not fall back to load-time fp16 dequant / ``F.linear``.
+      - True W8A8-Dynamic: ``npu_dynamic_quant`` (per-token act, int8) +
+        ``npu_quant_matmul`` on NZ ``[K, N]`` weights (``nz_then_t``).
+      - Preserves int8 GEMM benefit; do **not** use load-time fp16 dequant /
+        ``F.linear`` (pseudo-quant). See #14335 for residual 2B accuracy work.
     """
 
     def get_perchannel_param(
@@ -212,17 +213,18 @@ class AscendW8A8DynamicLinearMethod310(AscendW8A8Linear310pScheme):
         tp_rank: int | None = 0,
     ) -> torch.Tensor:
         del tp_rank
-        # NOTE(310P):
-        # - There is an accuracy issue currently, which is expected to be fixed in the next version.
-        quantized_x, pertoken_scale = torch_npu.npu_dynamic_quant(x)
+        # NOTE(310P): true W8A8-Dynamic only — per-token act quant + NZ quant_matmul.
+        # Do not fall back to load-time fp16 dequant / F.linear (loses int8 GEMM).
+        # Qwen3.5-2B GSM8K gap vs FP16 on some Graph/MTP paths is tracked in #14335.
+        x = x.contiguous()
+        quantized_x, pertoken_scale = torch_npu.npu_dynamic_quant(x, dst_type=torch.int8)
         need_unsqz = False
         if pertoken_scale.dim() == 2:
             need_unsqz = True
             quantized_x = quantized_x.squeeze(dim=1)
             pertoken_scale = pertoken_scale.squeeze(dim=1)
 
-        # NOTE(310P):
-        # - Currently, W8A8 dynamic quantization supports only symmetric quantization.
+        # NOTE(310P): symmetric W8A8-Dynamic only; weights are NZ [K, N] (nz_then_t).
         output = torch_npu.npu_quant_matmul(
             quantized_x,
             layer.weight.data,
@@ -236,7 +238,7 @@ class AscendW8A8DynamicLinearMethod310(AscendW8A8Linear310pScheme):
         return output
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # cast quantized weight tensors in NZ format for higher inference speed
+        # NZ then transpose → [K, N] for 310P npu_quant_matmul (keeps int8 NZ GEMM).
         layer.weight.data = maybe_trans_nz(layer.weight.data).transpose(0, 1)
         layer.weight_scale.data = layer.weight_scale.data.flatten()
         layer.weight_offset.data = layer.weight_offset.data.flatten()

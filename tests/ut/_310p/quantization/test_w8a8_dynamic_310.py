@@ -105,7 +105,7 @@ class TestAscendW8A8DynamicLinearMethod310(TestBase):
 
         output = self.method.apply(layer, x, tp_rank=0)
 
-        mock_npu_dynamic_quantize.assert_called_with(x.contiguous())
+        mock_npu_dynamic_quantize.assert_called_with(x.contiguous(), dst_type=torch.int8)
         mock_npu_quant_matmul.assert_called_once()
         (args, kwargs) = mock_npu_quant_matmul.call_args
 
