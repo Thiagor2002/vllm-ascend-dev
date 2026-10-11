@@ -15,7 +15,7 @@
 # This file is a part of the vllm-ascend project.
 #
 
-from typing import Any
+from typing import Any, cast
 
 import torch
 import torch_npu
@@ -183,16 +183,31 @@ class AscendW8A8DynamicFusedMoEMethod310(AscendMoEScheme):
         layer.w2_weight_offset.data = layer.w2_weight_offset.data.view(layer.w2_weight_offset.data.shape[0], -1)
 
 
+def _is_qwen35_2b_hidden() -> bool:
+    """Qwen3.5-2B is uniquely sensitive on 310P W8A8-Dynamic (#14335)."""
+    try:
+        model_config = get_current_vllm_config().model_config
+        text_config = getattr(model_config, "hf_text_config", None)
+        hidden = getattr(text_config, "hidden_size", None) if text_config is not None else None
+        if hidden is None:
+            hidden = getattr(model_config, "hidden_size", None)
+        return hidden is not None and int(hidden) == 2048
+    except Exception:
+        return False
+
+
 @register_scheme("W8A8_DYNAMIC", "linear")
 class AscendW8A8DynamicLinearMethod310(AscendW8A8Linear310pScheme):
     """310P-only W8A8 dynamic linear scheme.
 
     Notes:
       - This scheme is discovered via 310P local registry.
-      - True W8A8-Dynamic: ``npu_dynamic_quant`` (per-token act, int8) +
-        ``npu_quant_matmul`` on NZ ``[K, N]`` weights (``nz_then_t``).
-      - Preserves int8 GEMM benefit; do **not** use load-time fp16 dequant /
-        ``F.linear`` (pseudo-quant). See #14335 for residual 2B accuracy work.
+      - Default: ``npu_dynamic_quant`` + ``npu_quant_matmul`` on NZ ``[K, N]``
+        (``nz_then_t``) — true W8A8-Dynamic with int8 NZ GEMM.
+      - Qwen3.5-2B (hidden=2048): fused ``npu_quant_matmul_dequant`` with ND
+        ``[N, K]`` int8 weights (still pertoken dynamic act quant + int8 GEMM;
+        avoids NZ split-path error accumulation on the small 2B hybrid).
+      - Do **not** use load-time fp16 dequant / ``F.linear`` (pseudo-quant).
     """
 
     def get_perchannel_param(
@@ -213,32 +228,51 @@ class AscendW8A8DynamicLinearMethod310(AscendW8A8Linear310pScheme):
         tp_rank: int | None = 0,
     ) -> torch.Tensor:
         del tp_rank
-        # NOTE(310P): true W8A8-Dynamic only — per-token act quant + NZ quant_matmul.
-        # Do not fall back to load-time fp16 dequant / F.linear (loses int8 GEMM).
-        # Qwen3.5-2B GSM8K gap vs FP16 on some Graph/MTP paths is tracked in #14335.
+        # Flatten ND→2D: concurrent MTP/FULL paths may pass [..., K].
+        original_shape = x.shape
+        if x.dim() > 2:
+            x = x.reshape(-1, original_shape[-1])
         x = x.contiguous()
-        quantized_x, pertoken_scale = torch_npu.npu_dynamic_quant(x, dst_type=torch.int8)
-        need_unsqz = False
-        if pertoken_scale.dim() == 2:
-            need_unsqz = True
-            quantized_x = quantized_x.squeeze(dim=1)
-            pertoken_scale = pertoken_scale.squeeze(dim=1)
 
-        # NOTE(310P): symmetric W8A8-Dynamic only; weights are NZ [K, N] (nz_then_t).
-        output = torch_npu.npu_quant_matmul(
-            quantized_x,
-            layer.weight.data,
-            layer.weight_scale,
-            pertoken_scale=pertoken_scale,
-            bias=bias,
-            output_dtype=x.dtype,
-        )
-        if need_unsqz:
-            output = output.unsqueeze(dim=1)
+        if getattr(layer, "_310p_w8a8_fused_dequant", False):
+            # Qwen3.5-2B: fused pertoken dynamic quant + int8 matmul (ND weight).
+            output = torch_npu.npu_quant_matmul_dequant(
+                x,
+                layer.weight.data,
+                layer.weight_scale,
+                bias=bias,
+                quant_mode="pertoken",
+            )
+        else:
+            # Default 310P path: split dynamic quant + NZ quant_matmul.
+            quantized_x, pertoken_scale = torch_npu.npu_dynamic_quant(x, dst_type=torch.int8)
+            if pertoken_scale.dim() > 1:
+                quantized_x = quantized_x.reshape(-1, quantized_x.shape[-1])
+                pertoken_scale = pertoken_scale.reshape(-1)
+            output = torch_npu.npu_quant_matmul(
+                quantized_x,
+                layer.weight.data,
+                layer.weight_scale,
+                pertoken_scale=pertoken_scale,
+                bias=bias,
+                output_dtype=x.dtype,
+            )
+        if len(original_shape) > 2:
+            output = output.reshape(*original_shape[:-1], output.shape[-1])
         return output
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # NZ then transpose → [K, N] for 310P npu_quant_matmul (keeps int8 NZ GEMM).
-        layer.weight.data = maybe_trans_nz(layer.weight.data).transpose(0, 1)
-        layer.weight_scale.data = layer.weight_scale.data.flatten()
-        layer.weight_offset.data = layer.weight_offset.data.flatten()
+        weight = cast(torch.Tensor, layer.weight.data)
+        weight_scale = cast(torch.Tensor, layer.weight_scale.data)
+        weight_offset = cast(torch.Tensor, layer.weight_offset.data)
+        weight_scale = weight_scale.flatten()
+        weight_offset = weight_offset.flatten()
+        layer.weight_scale.data = weight_scale
+        layer.weight_offset.data = weight_offset
+        # 2B: keep ND [N, K] for npu_quant_matmul_dequant; others: NZ [K, N].
+        if _is_qwen35_2b_hidden():
+            layer._310p_w8a8_fused_dequant = True
+            layer.weight.data = weight.contiguous()
+        else:
+            layer._310p_w8a8_fused_dequant = False
+            layer.weight.data = maybe_trans_nz(weight).transpose(0, 1)
